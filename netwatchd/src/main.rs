@@ -1,3 +1,10 @@
+// netwatchd is a command-line daemon: writing to stdout and stderr is its
+// interface. The workspace denies that, which is correct for the GUI binary where
+// a stray println! is a bug, and wrong here. Cargo does not allow a member to
+// both inherit the workspace lints and override them, so the exception lives
+// here. Everything else, including the full pedantic set, still applies.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 //! netwatchd — headless network flow monitor with a browser dashboard.
 //!
 //! Captures packets with libpcap, aggregates them into flows, and serves a small
@@ -7,7 +14,7 @@
 //! Binds to 127.0.0.1 by default so `tailscale serve` can proxy to it without
 //! exposing it on the LAN.
 //!
-//! Capture needs CAP_NET_RAW. Composing packets is not required and is never
+//! Capture needs `CAP_NET_RAW`. Composing packets is not required and is never
 //! done here — this is read-only monitoring.
 
 use std::collections::HashMap;
@@ -108,38 +115,40 @@ fn friendly(msg: &str) -> String {
         format!(
             "{msg}\n\nThis is the CAP_NET_RAW check. Grant it to this binary once:\n  \
              sudo setcap cap_net_raw,cap_net_admin=eip {}",
-            std::env::current_exe()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<path to netwatchd>".into())
+            std::env::current_exe().map_or_else(
+                |_| "<path to netwatchd>".into(),
+                |p| p.display().to_string(),
+            )
         )
     } else {
         msg.to_string()
     }
 }
 
-fn capture_loop(iface: String, state: Arc<Mutex<State>>) {
-    let opened = pcap::Capture::from_device(iface.as_str())
+fn capture_loop(iface: &str, state: &Arc<Mutex<State>>) {
+    let opened = pcap::Capture::from_device(iface)
         .and_then(|c| c.promisc(true).snaplen(SNAPLEN).timeout(250).open());
     // setnonblock() consumes and returns the handle, so it has to be rebound
-    let mut cap = match opened.and_then(|c| c.setnonblock()) {
+    let mut cap = match opened.and_then(pcap::Capture::setnonblock) {
         Ok(c) => c,
-        Err(e) => return set_error(&state, &friendly(&e.to_string())),
+        Err(e) => return set_error(state, &friendly(&e.to_string())),
     };
 
     let mut last_stats = Instant::now();
     loop {
         match cap.next_packet() {
-            Ok(packet) => ingest(packet.data, &state),
+            Ok(packet) => ingest(packet.data, state),
             Err(pcap::Error::NoMorePackets) => std::thread::sleep(Duration::from_millis(40)),
             Err(pcap::Error::TimeoutExpired) => {}
-            Err(e) => return set_error(&state, &friendly(&e.to_string())),
+            Err(e) => return set_error(state, &friendly(&e.to_string())),
         }
         if last_stats.elapsed() >= Duration::from_secs(2) {
-            if let Ok(st) = cap.stats() {
-                if let Ok(mut s) = state.lock() {
-                    s.kernel_dropped = st.dropped;
-                    s.kernel_received = st.received;
-                }
+            // let-chain: both conditions have to hold before either value is used
+            if let Ok(st) = cap.stats()
+                && let Ok(mut s) = state.lock()
+            {
+                s.kernel_dropped = st.dropped;
+                s.kernel_received = st.received;
             }
             last_stats = Instant::now();
         }
@@ -216,7 +225,7 @@ fn observe(s: &mut State, proto: &'static str, src: Endpoint, dst: Endpoint, len
 /// each way. `None` for the local end means neither endpoint is ours — traffic
 /// routed through rather than to us — in which case no up/down can be claimed.
 fn orient(local_ips: &[IpAddr], k: &FlowKey, f: &Flow) -> (Option<Endpoint>, Endpoint, u64, u64) {
-    let is_local = |e: &Endpoint| local_ips.iter().any(|ip| *ip == e.ip);
+    let is_local = |e: &Endpoint| local_ips.contains(&e.ip);
     if is_local(&k.a) {
         (Some(k.a), k.b, f.ab_bytes, f.ba_bytes)
     } else if is_local(&k.b) {
@@ -230,7 +239,7 @@ fn orient(local_ips: &[IpAddr], k: &FlowKey, f: &Flow) -> (Option<Endpoint>, End
 /// any capability. Addresses are RFC 5737 documentation ranges, so nothing about
 /// this machine's real network ends up in a public repository, and `mode` is
 /// reported as "demo" so synthetic traffic can never be mistaken for capture.
-fn demo_traffic(state: Arc<Mutex<State>>) {
+fn demo_traffic(state: &Arc<Mutex<State>>) {
     const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     let peers = [
         (Ipv4Addr::new(192, 0, 2, 1), 443u16),
@@ -239,21 +248,23 @@ fn demo_traffic(state: Arc<Mutex<State>>) {
         (Ipv4Addr::new(198, 51, 100, 20), 80),
         (Ipv4Addr::new(203, 0, 113, 9), 853),
     ];
-    let local = Endpoint { ip: IpAddr::V4(LOCAL), port: 0 };
-    let mut n: u64 = 0;
+    let mut n: usize = 0;
     loop {
         std::thread::sleep(Duration::from_millis(350));
-        let (peer_ip, peer_port) = peers[(n as usize) % peers.len()];
-        let sleep_for = n;
+        let (peer_ip, peer_port) = peers[n % peers.len()];
+        // try_from rather than `as`: the values are bounded by the modulus, and
+        // this says so instead of truncating on a target with 32-bit pointers
+        let offset = u16::try_from(n % 900).unwrap_or(0);
+        let extra = u64::try_from(n % 9000).unwrap_or(0);
+        let ours = Endpoint { ip: IpAddr::V4(LOCAL), port: 40000 + offset };
         let peer = Endpoint { ip: IpAddr::V4(peer_ip), port: peer_port };
-        let sport_endpoint = Endpoint { ip: local.ip, port: 40000 + (n % 900) as u16 };
         let now = match state.lock() {
             Ok(s) => s.started.elapsed().as_secs(),
             Err(_) => return,
         };
         if let Ok(mut s) = state.lock() {
-            observe(&mut s, "TCP", sport_endpoint, peer, 128, now);
-            observe(&mut s, "TCP", peer, sport_endpoint, 1400 + sleep_for % 9000, now);
+            observe(&mut s, "TCP", ours, peer, 128, now);
+            observe(&mut s, "TCP", peer, ours, 1400 + extra, now);
         }
         n += 1;
     }
@@ -302,10 +313,10 @@ fn list_ifaces() {
                     d.name,
                     if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") }
                 );
-                if let Some(desc) = d.desc {
-                    if !desc.trim().is_empty() {
-                        println!("  {:<16}   {}", "", desc.trim());
-                    }
+                if let Some(desc) = d.desc
+                    && !desc.trim().is_empty()
+                {
+                    println!("  {:<16}   {}", "", desc.trim());
                 }
             }
         }
@@ -320,7 +331,7 @@ fn stats_json(state: &Arc<Mutex<State>>) -> String {
         return "{\"error\":\"state poisoned\"}".into();
     };
     let mut flows: Vec<(&FlowKey, &Flow)> = s.flows.iter().collect();
-    flows.sort_by(|a, b| b.1.bytes().cmp(&a.1.bytes()));
+    flows.sort_by_key(|a| std::cmp::Reverse(a.1.bytes()));
 
     let top_flows: Vec<serde_json::Value> = flows
         .iter()
@@ -354,7 +365,7 @@ fn stats_json(state: &Arc<Mutex<State>>) -> String {
         }
     }
     let mut hosts: Vec<(String, u64)> = by_host.into_iter().collect();
-    hosts.sort_by(|a, b| b.1.cmp(&a.1));
+    hosts.sort_by_key(|a| std::cmp::Reverse(a.1));
     let top_hosts: Vec<serde_json::Value> = hosts
         .into_iter()
         .take(12)
@@ -381,19 +392,16 @@ fn stats_json(state: &Arc<Mutex<State>>) -> String {
 
 //──────────────────────────────────────────────────────────────── http
 
-fn http_loop(listener: TcpListener, state: Arc<Mutex<State>>) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let st = state.clone();
-                std::thread::spawn(move || handle(s, st));
-            }
-            Err(_) => continue,
-        }
+fn http_loop(listener: &TcpListener, state: &Arc<Mutex<State>>) {
+    // a failed accept is not fatal: skip it and keep serving
+    for s in listener.incoming().flatten() {
+        // each connection gets its own handle on the shared state
+        let st = state.clone();
+        std::thread::spawn(move || handle(s, &st));
     }
 }
 
-fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
+fn handle(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
     let Ok(peek) = stream.try_clone() else { return };
     let mut reader = BufReader::new(peek);
     let mut request = String::new();
@@ -412,16 +420,15 @@ fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
     loop {
         let mut h = String::new();
         match reader.read_line(&mut h) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(_) if h == "\r\n" || h == "\n" => break,
             Ok(_) => {}
-            Err(_) => break,
         }
     }
 
     let (code, ctype, body) = match path.as_str() {
         "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", DASHBOARD.to_string()),
-        "/api/stats" => ("200 OK", "application/json", stats_json(&state)),
+        "/api/stats" => ("200 OK", "application/json", stats_json(state)),
         "/healthz" => ("200 OK", "text/plain", "ok".to_string()),
         "/favicon.ico" => ("204 No Content", "text/plain", String::new()),
         _ => ("404 Not Found", "text/plain", "not found".to_string()),
@@ -437,7 +444,7 @@ fn handle(mut stream: TcpStream, state: Arc<Mutex<State>>) {
 
 //──────────────────────────────────────────────────────────────── ui
 
-const DASHBOARD: &str = r##"<!doctype html>
+const DASHBOARD: &str = r#"<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -519,7 +526,7 @@ async function tick(){
 tick(); setInterval(tick, 2000);
 </script>
 </body></html>
-"##;
+"#;
 
 //──────────────────────────────────────────────────────────────── main
 
@@ -539,7 +546,7 @@ fn main() {
             }
             "--bind" => {
                 if let Some(v) = args.get(i + 1) {
-                    bind = v.clone();
+                    bind.clone_from(v);
                 }
                 i += 2;
             }
@@ -602,11 +609,11 @@ fn main() {
     if demo {
         println!("netwatchd in demo mode: synthetic traffic, nothing is captured");
         let st = state.clone();
-        std::thread::spawn(move || demo_traffic(st));
+        std::thread::spawn(move || demo_traffic(&st));
     } else {
         let st = state.clone();
         let name = chosen.clone();
-        std::thread::spawn(move || capture_loop(name, st));
+        std::thread::spawn(move || capture_loop(&name, &st));
     }
 
     let addr = format!("{bind}:{port}");
@@ -618,11 +625,16 @@ fn main() {
         }
     };
     println!("netwatchd listening on http://{addr}  (interface: {chosen})");
-    http_loop(listener, state);
+    http_loop(&listener, &state);
 }
 
 #[cfg(test)]
 mod tests {
+    // expect() is how a test states what it assumes; a broken assumption should
+    // panic and name itself. The workspace denies it in shipped code, where a
+    // panic is not an acceptable outcome.
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     fn state(local: &[&str]) -> State {
