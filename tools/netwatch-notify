@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""netwatch-notify — deliver netwatchd alerts to Telegram.
+
+Reads the JSON-lines spool that netwatchd writes, sends each new alert to a
+Telegram chat, and remembers how far it has read.
+
+Standard library only, on purpose. The daemon stays free of any HTTP or TLS
+dependency, delivery can be fixed or upgraded without rebuilding or restarting
+capture, and one bad recipient cannot stall the monitor.
+
+  netwatch-notify --config ~/.config/netwatch/notify.json     # drain, then exit
+  netwatch-notify --config ... --follow                       # stay running
+  netwatch-notify --config ... --test                         # send a test message
+  netwatch-notify --config ... --dry-run                      # print, send nothing
+
+Delivery is at-least-once: the read offset is advanced only after Telegram has
+accepted the message, so a failure retries instead of losing the alert. A crash
+between sending and saving can therefore duplicate one alert. That is the right
+trade for security alerts, and it is stated here rather than left implicit.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_CONFIG = "~/.config/netwatch/notify.json"
+DEFAULT_STATE = "~/.local/state/netwatch-notify.json"
+SEVERITIES = {"info": 1, "notable": 2, "alert": 3}
+PER_MESSAGE_PAUSE = 1.1  # Telegram allows about 30 messages a second; be polite
+
+
+def load_config(path):
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            config = json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"no config at {path} — start from examples/notify.json")
+    except ValueError as exc:
+        sys.exit(f"config at {path} is not valid JSON: {exc}")
+    config.setdefault("api_base", "https://api.telegram.org")
+    config.setdefault("spool", "/var/lib/netwatch/alerts.jsonl")
+    config.setdefault("state", DEFAULT_STATE)
+    config.setdefault("min_severity", "info")
+    if config["min_severity"] not in SEVERITIES:
+        sys.exit(f"min_severity must be one of {', '.join(SEVERITIES)}")
+    return config
+
+
+def load_state(path):
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"offset": 0, "sent": 0}
+
+
+def save_state(path, state):
+    """Write the offset atomically: a truncated state file would re-send the
+    whole spool, so it is replaced rather than overwritten in place."""
+    full = os.path.expanduser(path)
+    parent = os.path.dirname(full)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = full + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, full)
+
+
+def format_alert(alert):
+    marks = {"alert": "\N{POLICE CARS REVOLVING LIGHT}", "notable": "\N{WARNING SIGN}", "info": "\N{INFORMATION SOURCE}"}
+    mark = marks.get(alert.get("severity", ""), "\N{BULLET}")
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert.get("ts", 0)))
+    return "\n".join(
+        [
+            f"{mark} {alert.get('subject', '(no subject)')}",
+            f"{alert.get('kind', 'event')} · {when}",
+            alert.get("detail", ""),
+        ]
+    ).strip()
+
+
+def send(config, text):
+    token = config.get("bot_token")
+    chat = config.get("chat_id")
+    if not token or not chat:
+        sys.exit(
+            "bot_token and chat_id are required in the config.\n"
+            "Create a bot with @BotFather, then message it and read the chat id "
+            "from https://api.telegram.org/bot<token>/getUpdates"
+        )
+    url = f"{config['api_base'].rstrip('/')}/bot{token}/sendMessage"
+    body = urllib.parse.urlencode(
+        {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+    ).encode()
+    request = urllib.request.Request(url, data=body)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200]
+        raise RuntimeError(f"telegram returned HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"cannot reach telegram: {exc.reason}") from exc
+    if not payload.get("ok", False):
+        raise RuntimeError(f"telegram rejected the message: {payload.get('description', payload)}")
+
+
+def read_new(config, state):
+    """Return alerts written since the last run, and advance the offset past
+    each complete line. A trailing partial line is left for the next pass, so a
+    reader can never act on half a record."""
+    path = os.path.expanduser(config["spool"])
+    if not os.path.exists(path):
+        return []
+    alerts = []
+    offset = state.get("offset", 0)
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break
+            offset += len(raw)
+            try:
+                alerts.append(json.loads(raw))
+            except ValueError:
+                continue  # unparseable line: skip it, never stall the queue
+    state["offset"] = offset
+    return alerts
+
+
+def drain(config, state, dry_run, verbose):
+    alerts = read_new(config, state)
+    floor = SEVERITIES[config["min_severity"]]
+    sent = 0
+    for alert in alerts:
+        if SEVERITIES.get(alert.get("severity", "info"), 1) < floor:
+            if verbose:
+                print(f"skipped (below {config['min_severity']}): {alert.get('subject')}")
+            continue
+        text = format_alert(alert)
+        if dry_run:
+            print(f"--- would send ---\n{text}")
+        else:
+            send(config, text)
+            state["sent"] = state.get("sent", 0) + 1
+            if verbose:
+                print(f"sent: {alert.get('subject')}")
+            time.sleep(PER_MESSAGE_PAUSE)
+        sent += 1
+    if not dry_run:
+        save_state(config["state"], state)
+    return sent
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Deliver netwatchd alerts to Telegram.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"config file (default {DEFAULT_CONFIG})")
+    parser.add_argument("--follow", action="store_true", help="stay running instead of draining once")
+    parser.add_argument("--interval", type=float, default=15.0, help="seconds between passes with --follow")
+    parser.add_argument("--test", action="store_true", help="send one test message and exit")
+    parser.add_argument("--dry-run", action="store_true", help="print what would be sent")
+    parser.add_argument("--api-base", help="override the Telegram API base (for testing)")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    if args.api_base:
+        config["api_base"] = args.api_base
+    verbose = not args.quiet
+
+    if args.test:
+        if args.dry_run:
+            print("--- would send ---\nnetwatch-notify test message")
+            return 0
+        try:
+            send(config, "netwatch-notify test message — delivery is wired up.")
+        except RuntimeError as exc:
+            sys.exit(f"test failed: {exc}")
+        print("test message accepted by Telegram")
+        return 0
+
+    state = load_state(config["state"])
+    if not args.follow:
+        try:
+            count = drain(config, state, args.dry_run, verbose)
+        except RuntimeError as exc:
+            # exit non-zero without advancing the offset, so a timer retries
+            sys.exit(f"delivery failed, alert kept for retry: {exc}")
+        if verbose and count == 0:
+            print("nothing new")
+        return 0
+
+    while True:
+        try:
+            drain(config, state, args.dry_run, verbose)
+        except RuntimeError as exc:
+            print(f"delivery failed, will retry: {exc}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

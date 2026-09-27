@@ -6,7 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/netwatchd --iface eth0 --port 8790
+StateDirectory=netwatch
+ExecStart=/usr/local/bin/netwatchd --iface eth0 --port 8790 --alerts /var/lib/netwatch/alerts.jsonl
 Restart=always
 RestartSec=5
 

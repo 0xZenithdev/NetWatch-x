@@ -1,0 +1,12 @@
+[Unit]
+Description=netwatch alert notifier — delivers alerts to Telegram
+Documentation=https://github.com/0xZenithdev/NetWatch-x
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netwatch-notify --config /etc/netwatch/notify.json
+# A failed delivery exits non-zero on purpose, so the timer retries and the
+# pending alert is never dropped.
+SuccessExitStatus=0

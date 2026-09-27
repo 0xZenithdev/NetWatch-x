@@ -77,6 +77,36 @@ added authentication — a live view of your server's connections is not somethi
   through, no direction is claimed rather than guessing.
 - **Read-only.** `CAP_NET_RAW` is needed to observe; nothing is ever transmitted or modified.
 
+## Alerts
+
+The daemon appends alerts to a JSON-lines spool and serves the most recent ones
+from `/api/stats`. A separate `tools/netwatch-notify` delivers them to Telegram.
+
+Delivery is deliberately **not** part of the daemon: netwatchd keeps no HTTP or
+TLS dependency, delivery can be fixed or reconfigured without restarting
+capture, and an unreachable Telegram can never stall packet capture. The reader
+only advances its offset after Telegram accepts a message, so a failure retries
+instead of losing the alert.
+
+```sh
+# 1. create a bot with @BotFather, then message it and read the chat id:
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":[-0-9]*'
+
+# 2. configure and test
+cp examples/notify.json ~/.config/netwatch/notify.json   # fill in token + chat id
+tools/netwatch-notify --config ~/.config/netwatch/notify.json --dry-run
+tools/netwatch-notify --config ~/.config/netwatch/notify.json --test
+
+# 3. prove the whole path without waiting for a real event
+netwatchd --test-alert --alerts /path/to/alerts.jsonl
+tools/netwatch-notify --config ~/.config/netwatch/notify.json
+```
+
+`min_severity` (`info`, `notable`, `alert`) filters at delivery time, so raising
+it suppresses noise without touching the daemon. `--follow` keeps the notifier
+running instead of draining once; `packaging/netwatch-notify.timer` polls every
+30 seconds instead.
+
 ## Status
 
 `netwatchd` currently reports bandwidth, volume, protocols, top destinations and top flows. Planned,

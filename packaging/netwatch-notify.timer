@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the netwatch alert notifier every 30 seconds
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

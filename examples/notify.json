@@ -1,0 +1,8 @@
+{
+  "bot_token": "PASTE_TOKEN_FROM_BOTFATHER",
+  "chat_id": "PASTE_CHAT_ID",
+  "api_base": "https://api.telegram.org",
+  "spool": "/var/lib/netwatch/alerts.jsonl",
+  "state": "~/.local/state/netwatch-notify.json",
+  "min_severity": "notable"
+}

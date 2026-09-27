@@ -79,6 +79,22 @@ sudo systemctl enable --now netwatchd.service
 
 Allow ~2 seconds before the dashboard has data.
 
+## Alert delivery
+
+`tools/netwatchd` writes alerts to a spool file; `tools/netwatch-notify` reads
+that file and posts to Telegram. Point the daemon at a spool with `--alerts`,
+then run the notifier under the timer in `packaging/`:
+
+```sh
+sudo install -m 644 packaging/netwatch-notify.service packaging/netwatch-notify.timer /etc/systemd/system/
+sudo install -d /etc/netwatch && sudo install -m 600 examples/notify.json /etc/netwatch/notify.json
+sudo systemctl enable --now netwatch-notify.timer
+```
+
+The notifier takes `--dry-run` (print instead of send), `--test` (send one
+message), `--follow` (stay running), and `--api-base` (point at a mock server,
+which is how its delivery path is tested without a token).
+
 ## The desktop application (Sniffnet's original GUI)
 
 On Debian:
