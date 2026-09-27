@@ -41,6 +41,10 @@ OPTIONS:
     -p, --port <PORT>    port to serve on (default: 8790)
         --demo           serve the dashboard without capturing anything
         --list           list available interfaces and exit
+        --alerts <PATH>  append alerts as JSON lines to PATH
+        --test-alert     append one test alert and exit, to prove delivery works
+        --devices <PATH> remember devices across restarts, so a crash or an
+                         upgrade does not re-announce every device as new
     -h, --help           show this help
 
 NOTE:
@@ -232,6 +236,115 @@ fn sweep_devices(s: &mut State, now: u64) {
             &format!("no traffic for over {DEVICE_IDLE_SECS}s"),
         );
     }
+}
+
+/// Keep the device inventory alive: load what was remembered, retire devices
+/// that have gone quiet, and write the inventory back so a restart does not
+/// re-announce every device on the network.
+fn spawn_device_keeper(state: Arc<Mutex<State>>, devices: Option<std::path::PathBuf>) {
+    if let Some(path) = &devices {
+        let known = match state.lock() {
+            Ok(mut s) => load_devices(path, &mut s),
+            Err(_) => 0,
+        };
+        println!("devices: {known} known from {}", path.display());
+    }
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(30));
+        let now = match state.lock() {
+            Ok(s) => s.started.elapsed().as_secs(),
+            Err(_) => return,
+        };
+        if let Ok(mut s) = state.lock() {
+            sweep_devices(&mut s, now);
+            if let Some(path) = &devices
+                && let Err(e) = save_devices(path, &s)
+            {
+                eprintln!("could not save devices: {e}");
+            }
+        }
+    });
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff`.
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
+/// Write the inventory where a restart can find it, atomically so a crash
+/// mid-write cannot leave a half-file behind.
+fn save_devices(path: &std::path::Path, s: &State) -> std::io::Result<()> {
+    let rows: Vec<serde_json::Value> = s
+        .devices
+        .values()
+        .map(|d| {
+            serde_json::json!({
+                "mac": mac_string(d.mac),
+                "ips": d.ips.iter().map(ToString::to_string).collect::<Vec<String>>(),
+                "first_seen": d.first_seen,
+                "last_seen": d.last_seen,
+                "packets": d.packets,
+                "bytes": d.bytes,
+            })
+        })
+        .collect();
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&rows).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Load a previously written inventory. Without this a restart re-announces
+/// every device on the network as new, which is an alert storm on any crash —
+/// exactly the moment an operator is least willing to be shouted at.
+///
+/// Loaded devices are treated as already known, so they are not announced
+/// again. They start offline and come online on their next frame.
+fn load_devices(path: &std::path::Path, s: &mut State) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return 0;
+    };
+    let mut loaded = 0;
+    for row in rows {
+        let Some(mac) = row.get("mac").and_then(|v| v.as_str()).and_then(parse_mac) else {
+            continue;
+        };
+        let ips: Vec<IpAddr> = row
+            .get("ips")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .filter_map(|x| x.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let num = |key: &str| row.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        s.devices.insert(
+            mac,
+            Device {
+                mac,
+                ips,
+                first_seen: num("first_seen"),
+                last_seen: num("last_seen"),
+                packets: num("packets"),
+                bytes: num("bytes"),
+                online: false,
+            },
+        );
+        loaded += 1;
+    }
+    loaded
 }
 
 //──────────────────────────────────────────────────────────────── alerts
@@ -797,6 +910,7 @@ struct Config {
     port: Option<u16>,
     demo: bool,
     alerts: Option<std::path::PathBuf>,
+    devices: Option<std::path::PathBuf>,
     test_alert: bool,
 }
 
@@ -831,6 +945,10 @@ fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
                 c.alerts = args.get(i + 1).map(std::path::PathBuf::from);
                 i += 2;
             }
+            "--devices" => {
+                c.devices = args.get(i + 1).map(std::path::PathBuf::from);
+                i += 2;
+            }
             "--test-alert" => {
                 c.test_alert = true;
                 i += 1;
@@ -859,7 +977,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let Config { iface, bind, port, demo, alerts, test_alert } = cfg;
+    let Config { iface, bind, port, demo, alerts, devices, test_alert } = cfg;
     let bind = bind.unwrap_or_else(|| DEFAULT_BIND.to_string());
     let port = port.unwrap_or(DEFAULT_PORT);
 
@@ -921,20 +1039,7 @@ fn main() {
         std::thread::spawn(move || capture_loop(&name, &st));
     }
 
-    // Retire silent devices even when no packets are arriving.
-    {
-        let sweep_state = state.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(30));
-            let now = match sweep_state.lock() {
-                Ok(s) => s.started.elapsed().as_secs(),
-                Err(_) => return,
-            };
-            if let Ok(mut s) = sweep_state.lock() {
-                sweep_devices(&mut s, now);
-            }
-        });
-    }
+    spawn_device_keeper(Arc::clone(&state), devices);
 
     let addr = format!("{bind}:{port}");
     let listener = match TcpListener::bind(&addr) {
@@ -1066,6 +1171,51 @@ mod tests {
 
     fn mac6(last: u8) -> [u8; 6] {
         [0x02, 0x00, 0x00, 0x00, 0x00, last]
+    }
+
+    #[test]
+    fn a_restart_does_not_re_announce_the_network() {
+        let dir = std::env::temp_dir().join(format!("nw-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("devices.json");
+
+        let mut first = state(&["192.168.10.200"]);
+        learn_device(&mut first, mac6(1), ip("192.168.10.50"), 100, 0);
+        learn_device(&mut first, mac6(2), ip("192.168.10.51"), 200, 0);
+        assert_eq!(first.alerts.len(), 2);
+        save_devices(&path, &first).expect("inventory saved");
+
+        // A fresh process, as after a restart or an upgrade.
+        let mut second = state(&["192.168.10.200"]);
+        assert_eq!(load_devices(&path, &mut second), 2);
+        assert!(second.alerts.is_empty(), "a restart must not re-announce known devices");
+        assert_eq!(second.devices[&mac6(1)].bytes, 100);
+        assert!(!second.devices[&mac6(1)].online, "offline until it speaks again");
+
+        learn_device(&mut second, mac6(1), ip("192.168.10.50"), 5, 10);
+        assert!(second.devices[&mac6(1)].online, "it comes back on its next frame");
+        assert!(second.alerts.is_empty(), "a known device returning is not news");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_damaged_inventory_is_skipped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("nw-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("devices.json");
+        std::fs::write(
+            &path,
+            r#"[{"mac": "not-a-mac", "ips": ["192.168.10.9"]},
+                {"mac": "02:00:00:00:00:0a", "ips": ["192.168.10.9", "garbage"], "packets": 3},
+                {"no_mac_at_all": true}]"#,
+        )
+        .expect("wrote");
+        let mut s = state(&["192.168.10.200"]);
+        assert_eq!(load_devices(&path, &mut s), 1, "only the usable row is loaded");
+        assert_eq!(s.devices[&mac6(0x0a)].ips, vec![ip("192.168.10.9")], "bad addresses dropped");
+        assert_eq!(s.devices[&mac6(0x0a)].packets, 3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
