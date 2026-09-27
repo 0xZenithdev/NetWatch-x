@@ -105,6 +105,91 @@ struct State {
     note: Option<String>,
     /// Addresses of the interface being captured, used to tell "up" from "down".
     local_ips: Vec<IpAddr>,
+    /// Most recent alerts, newest last.
+    alerts: Vec<Alert>,
+    /// Where alerts are appended, if anywhere.
+    alert_sink: Option<std::path::PathBuf>,
+}
+
+//──────────────────────────────────────────────────────────────── alerts
+
+/// An event worth telling a human about.
+///
+/// Alerts are held in memory for the API and appended to a spool file that a
+/// separate notifier delivers. Keeping delivery out of this process means the
+/// daemon needs no HTTP or TLS stack at all, and a Telegram outage can never
+/// stall packet capture.
+#[derive(Clone)]
+struct Alert {
+    ts: u64,
+    kind: &'static str,
+    severity: &'static str,
+    subject: String,
+    detail: String,
+}
+
+/// How many alerts stay in memory (and therefore in the API payload).
+const ALERT_MEMORY: usize = 200;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl Alert {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ts": self.ts,
+            "kind": self.kind,
+            "severity": self.severity,
+            "subject": self.subject,
+            "detail": self.detail,
+        })
+    }
+}
+
+/// Append one alert as a single JSON line.
+///
+/// One line per alert is deliberate: a torn write can lose the alert being
+/// written but cannot corrupt the ones already spooled, and a tailing reader
+/// never has to parse a half-written record.
+fn append_alert(path: &std::path::Path, a: &Alert) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{}", a.to_json())
+}
+
+fn write_test_alert(path: &std::path::Path) -> std::io::Result<()> {
+    append_alert(
+        path,
+        &Alert {
+            ts: now_unix(),
+            kind: "test",
+            severity: "info",
+            subject: "netwatchd test alert".into(),
+            detail: "If you received this, the alert path works end to end.".into(),
+        },
+    )
+}
+
+/// Record an alert in memory and spool it. A failure to write the spool must
+/// never take down the caller: the alert is still in memory and in the API.
+fn emit_alert(s: &mut State, kind: &'static str, severity: &'static str, subject: &str, detail: &str) {
+    let a = Alert {
+        ts: now_unix(),
+        kind,
+        severity,
+        subject: subject.to_string(),
+        detail: detail.to_string(),
+    };
+    if let Some(path) = &s.alert_sink {
+        let _ = append_alert(path, &a);
+    }
+    s.alerts.push(a);
+    let len = s.alerts.len();
+    if len > ALERT_MEMORY {
+        s.alerts.drain(0..len - ALERT_MEMORY);
+    }
 }
 
 //──────────────────────────────────────────────────────────────── capture
@@ -158,6 +243,10 @@ fn capture_loop(iface: &str, state: &Arc<Mutex<State>>) {
 fn set_error(state: &Arc<Mutex<State>>, msg: &str) {
     if let Ok(mut s) = state.lock() {
         s.error = Some(msg.to_string());
+        // A monitor that has silently stopped monitoring is the worst failure
+        // mode there is, so losing capture raises an alert and not just a note
+        // on a dashboard nobody is looking at.
+        emit_alert(&mut s, "capture_failed", "alert", "capture stopped", msg);
     }
 }
 
@@ -372,7 +461,11 @@ fn stats_json(state: &Arc<Mutex<State>>) -> String {
         .map(|(host, bytes)| serde_json::json!({ "host": host, "bytes": bytes }))
         .collect();
 
+    let alerts: Vec<serde_json::Value> = s.alerts.iter().rev().take(50).map(Alert::to_json).collect();
+
     serde_json::json!({
+        "alerts": alerts,
+        "alert_count": s.alerts.len(),
         "iface": s.iface,
         "mode": s.mode,
         "uptime_s": s.started.elapsed().as_secs(),
@@ -530,50 +623,79 @@ tick(); setInterval(tick, 2000);
 
 //──────────────────────────────────────────────────────────────── main
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut iface: Option<String> = None;
-    let mut bind = DEFAULT_BIND.to_string();
-    let mut port = DEFAULT_PORT;
-    let mut demo = false;
+/// Everything the command line can configure.
+#[derive(Default)]
+struct Config {
+    iface: Option<String>,
+    bind: Option<String>,
+    port: Option<u16>,
+    demo: bool,
+    alerts: Option<std::path::PathBuf>,
+    test_alert: bool,
+}
 
+/// Parse arguments.
+///
+/// `Ok(None)` means the requested work is already done — `--help` and `--list`
+/// print and return — and an unknown flag is an error rather than something to
+/// ignore, because a typo silently running the daemon unconfigured is worse
+/// than refusing to start.
+fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
+    let mut c = Config::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-i" | "--iface" => {
-                iface = args.get(i + 1).cloned();
+                c.iface = args.get(i + 1).cloned();
                 i += 2;
             }
             "--bind" => {
-                if let Some(v) = args.get(i + 1) {
-                    bind.clone_from(v);
-                }
+                c.bind = args.get(i + 1).cloned();
                 i += 2;
             }
             "-p" | "--port" => {
-                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
-                    port = v;
-                }
+                c.port = args.get(i + 1).and_then(|v| v.parse().ok());
                 i += 2;
             }
             "--demo" => {
-                demo = true;
+                c.demo = true;
+                i += 1;
+            }
+            "--alerts" => {
+                c.alerts = args.get(i + 1).map(std::path::PathBuf::from);
+                i += 2;
+            }
+            "--test-alert" => {
+                c.test_alert = true;
                 i += 1;
             }
             "--list" => {
                 list_ifaces();
-                return;
+                return Ok(None);
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
-                return;
+                return Ok(None);
             }
-            other => {
-                eprintln!("unknown argument: {other}\n\n{USAGE}");
-                std::process::exit(2);
-            }
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
+    Ok(Some(c))
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = match parse_args(&args) {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("{e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let Config { iface, bind, port, demo, alerts, test_alert } = cfg;
+    let bind = bind.unwrap_or_else(|| DEFAULT_BIND.to_string());
+    let port = port.unwrap_or(DEFAULT_PORT);
 
     let chosen = if demo {
         iface.unwrap_or_else(|| "demo".to_string())
@@ -586,6 +708,20 @@ fn main() {
             }
         }
     };
+
+    if test_alert {
+        let path = alerts.unwrap_or_else(|| std::path::PathBuf::from("alerts.jsonl"));
+        match write_test_alert(&path) {
+            Ok(()) => {
+                println!("wrote one test alert to {}", path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("cannot write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
 
     let local_ips = if demo {
         vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
@@ -604,6 +740,8 @@ fn main() {
         error: None,
         note: None,
         local_ips,
+        alerts: Vec::new(),
+        alert_sink: alerts,
     }));
 
     if demo {
@@ -650,6 +788,8 @@ mod tests {
             error: None,
             note: None,
             local_ips: local.iter().map(|s| s.parse().expect("test ip")).collect(),
+            alerts: Vec::new(),
+            alert_sink: None,
         }
     }
 
@@ -735,5 +875,69 @@ mod tests {
         assert_eq!(f.bytes(), 1000);
         assert_eq!(f.first_seen, 0);
         assert_eq!(f.last_seen, 9);
+    }
+
+    #[test]
+    fn arguments_are_parsed_or_refused() {
+        let ok = parse_args(&[
+            "--iface".into(),
+            "eth0".into(),
+            "--port".into(),
+            "9000".into(),
+            "--demo".into(),
+        ])
+        .expect("valid arguments")
+        .expect("a config, not early return");
+        assert_eq!(ok.iface.as_deref(), Some("eth0"));
+        assert_eq!(ok.port, Some(9000));
+        assert!(ok.demo);
+        assert!(parse_args(&["--nonsense".into()]).is_err(), "a typo must be an error");
+        assert!(
+            parse_args(&["--help".into()]).expect("help is fine").is_none(),
+            "--help does its work and returns"
+        );
+    }
+
+    #[test]
+    fn alerts_reach_both_memory_and_the_spool() {
+        let path = std::env::temp_dir().join(format!("netwatch-alerts-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = state(&[]);
+        s.alert_sink = Some(path.clone());
+        emit_alert(&mut s, "new_device", "alert", "aa:bb:cc:dd:ee:ff", "192.168.10.42 first seen");
+        assert_eq!(s.alerts.len(), 1);
+        assert_eq!(s.alerts[0].kind, "new_device");
+        assert_eq!(s.alerts[0].severity, "alert");
+        let body = std::fs::read_to_string(&path).expect("spool readable");
+        let v: serde_json::Value = serde_json::from_str(body.lines().next().expect("one line")).expect("valid json");
+        assert_eq!(v["kind"], "new_device");
+        assert!(v["ts"].as_u64().unwrap_or(0) > 0, "alerts carry a wall-clock timestamp");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_spool_is_append_only_one_line_per_alert() {
+        let path = std::env::temp_dir().join(format!("netwatch-spool-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        for _ in 0..3 {
+            write_test_alert(&path).expect("write");
+        }
+        let body = std::fs::read_to_string(&path).expect("spool readable");
+        assert_eq!(body.lines().count(), 3);
+        for line in body.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("every line stands alone");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn alert_memory_is_bounded_and_keeps_the_newest() {
+        let mut s = state(&[]);
+        for i in 0..(ALERT_MEMORY + 25) {
+            emit_alert(&mut s, "new_device", "alert", "x", &i.to_string());
+        }
+        assert_eq!(s.alerts.len(), ALERT_MEMORY, "memory must not grow without limit");
+        let newest = &s.alerts[s.alerts.len() - 1];
+        assert_eq!(newest.detail, (ALERT_MEMORY + 24).to_string(), "newest survive, oldest are dropped");
     }
 }
