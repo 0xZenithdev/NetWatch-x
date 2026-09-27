@@ -23,7 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use etherparse::{LinkSlice, NetSlice, SlicedPacket, TransportSlice};
 
 const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8790;
@@ -109,6 +109,106 @@ struct State {
     alerts: Vec<Alert>,
     /// Where alerts are appended, if anywhere.
     alert_sink: Option<std::path::PathBuf>,
+    /// Hosts seen on the wire, keyed by MAC.
+    devices: HashMap<[u8; 6], Device>,
+}
+
+//──────────────────────────────────────────────────────────────── devices
+
+/// A host seen on the wire, identified by its MAC.
+#[derive(Clone)]
+struct Device {
+    mac: [u8; 6],
+    ips: Vec<IpAddr>,
+    first_seen: u64,
+    last_seen: u64,
+    packets: u64,
+    bytes: u64,
+    online: bool,
+}
+
+/// A device that keeps changing address would otherwise grow this list without
+/// limit; eight is far more than an honest host needs.
+const MAX_IPS_PER_DEVICE: usize = 8;
+/// How long a device may be silent before it is called offline.
+const DEVICE_IDLE_SECS: u64 = 300;
+
+fn mac_string(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+/// MACs that cannot belong to a host: broadcast, multicast, or all zero.
+fn is_host_mac(mac: [u8; 6]) -> bool {
+    mac != [0u8; 6] && mac[0] & 1 == 0
+}
+
+/// Record a sighting of a device, raising an alert the first time a MAC is seen.
+///
+/// A MAC that has never been seen before means a device joined the network;
+/// noticing that is the core of an intruder detector, and because this box is
+/// the gateway it gets the sighting for free, from traffic it was already
+/// handling. Nothing has to be scanned, so nothing is disturbed on the LAN.
+fn learn_device(s: &mut State, mac: [u8; 6], ip: IpAddr, len: u64, now: u64) {
+    if !is_host_mac(mac) {
+        return;
+    }
+    // Our own addresses are not a device worth reporting.
+    if s.local_ips.contains(&ip) {
+        return;
+    }
+    if let Some(d) = s.devices.get_mut(&mac) {
+        d.last_seen = now;
+        d.packets += 1;
+        d.bytes += len;
+        d.online = true;
+        if !d.ips.contains(&ip) && d.ips.len() < MAX_IPS_PER_DEVICE {
+            d.ips.push(ip);
+        }
+        return;
+    }
+    s.devices.insert(
+        mac,
+        Device {
+            mac,
+            ips: vec![ip],
+            first_seen: now,
+            last_seen: now,
+            packets: 1,
+            bytes: len,
+            online: true,
+        },
+    );
+    emit_alert(
+        s,
+        "new_device",
+        "alert",
+        &mac_string(mac),
+        &format!("{ip} — first sighting on this network"),
+    );
+}
+
+/// Retire devices that have gone quiet. A device that stops transmitting is
+/// worth knowing about, and one that returns is worth knowing about too.
+fn sweep_devices(s: &mut State, now: u64) {
+    let mut went_offline = Vec::new();
+    for d in s.devices.values_mut() {
+        if d.online && now.saturating_sub(d.last_seen) > DEVICE_IDLE_SECS {
+            d.online = false;
+            went_offline.push(mac_string(d.mac));
+        }
+    }
+    for mac in went_offline {
+        emit_alert(
+            s,
+            "device_offline",
+            "notable",
+            &mac,
+            &format!("no traffic for over {DEVICE_IDLE_SECS}s"),
+        );
+    }
 }
 
 //──────────────────────────────────────────────────────────────── alerts
@@ -271,9 +371,22 @@ fn ingest(data: &[u8], state: &Arc<Mutex<State>>) {
         _ => ("other", 0, 0),
     };
 
+    // The Ethernet header identifies which host sent this; that is the whole
+    // basis of device discovery here.
+    let macs = match &pkt.link {
+        Some(LinkSlice::Ethernet2(eth)) => Some((eth.source(), eth.destination())),
+        _ => None,
+    };
+
     let len = data.len() as u64;
     let Ok(mut s) = state.lock() else { return };
     let now = s.started.elapsed().as_secs();
+    if let Some((src_mac, dst_mac)) = macs {
+        // Both ends are real hosts on this LAN: the sender, and the receiver
+        // (which is how a download-heavy device is noticed at all).
+        learn_device(&mut s, src_mac, src, len, now);
+        learn_device(&mut s, dst_mac, dst, len, now);
+    }
     observe(
         &mut s,
         proto,
@@ -337,6 +450,14 @@ fn demo_traffic(state: &Arc<Mutex<State>>) {
         (Ipv4Addr::new(198, 51, 100, 20), 80),
         (Ipv4Addr::new(203, 0, 113, 9), 853),
     ];
+    // Plausible LAN hosts, so the device list and new-device alerts are
+    // exercised in demo mode too — demo traffic never reaches the packet
+    // parser, which is where real learning happens.
+    let lan: [([u8; 6], Ipv4Addr); 3] = [
+        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x01], Ipv4Addr::new(192, 0, 2, 20)),
+        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x02], Ipv4Addr::new(192, 0, 2, 21)),
+        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x03], Ipv4Addr::new(192, 0, 2, 22)),
+    ];
     let mut n: usize = 0;
     loop {
         std::thread::sleep(Duration::from_millis(350));
@@ -354,6 +475,8 @@ fn demo_traffic(state: &Arc<Mutex<State>>) {
         if let Ok(mut s) = state.lock() {
             observe(&mut s, "TCP", ours, peer, 128, now);
             observe(&mut s, "TCP", peer, ours, 1400 + extra, now);
+            let (mac, lan_ip) = lan[(n / 4) % lan.len()];
+            learn_device(&mut s, mac, IpAddr::V4(lan_ip), 200 + extra, now);
         }
         n += 1;
     }
@@ -463,9 +586,29 @@ fn stats_json(state: &Arc<Mutex<State>>) -> String {
 
     let alerts: Vec<serde_json::Value> = s.alerts.iter().rev().take(50).map(Alert::to_json).collect();
 
+    let mut devices: Vec<&Device> = s.devices.values().collect();
+    devices.sort_by_key(|d| std::cmp::Reverse(d.last_seen));
+    let devices: Vec<serde_json::Value> = devices
+        .iter()
+        .take(200)
+        .map(|d| {
+            serde_json::json!({
+                "mac": mac_string(d.mac),
+                "ips": d.ips.iter().map(ToString::to_string).collect::<Vec<String>>(),
+                "first_seen": d.first_seen,
+                "last_seen": d.last_seen,
+                "packets": d.packets,
+                "bytes": d.bytes,
+                "online": d.online,
+            })
+        })
+        .collect();
+
     serde_json::json!({
         "alerts": alerts,
         "alert_count": s.alerts.len(),
+        "devices": devices,
+        "device_count": s.devices.len(),
         "iface": s.iface,
         "mode": s.mode,
         "uptime_s": s.started.elapsed().as_secs(),
@@ -742,6 +885,7 @@ fn main() {
         local_ips,
         alerts: Vec::new(),
         alert_sink: alerts,
+        devices: HashMap::new(),
     }));
 
     if demo {
@@ -752,6 +896,21 @@ fn main() {
         let st = state.clone();
         let name = chosen.clone();
         std::thread::spawn(move || capture_loop(&name, &st));
+    }
+
+    // Retire silent devices even when no packets are arriving.
+    {
+        let sweep_state = state.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let now = match sweep_state.lock() {
+                Ok(s) => s.started.elapsed().as_secs(),
+                Err(_) => return,
+            };
+            if let Ok(mut s) = sweep_state.lock() {
+                sweep_devices(&mut s, now);
+            }
+        });
     }
 
     let addr = format!("{bind}:{port}");
@@ -790,6 +949,7 @@ mod tests {
             local_ips: local.iter().map(|s| s.parse().expect("test ip")).collect(),
             alerts: Vec::new(),
             alert_sink: None,
+            devices: HashMap::new(),
         }
     }
 
@@ -875,6 +1035,88 @@ mod tests {
         assert_eq!(f.bytes(), 1000);
         assert_eq!(f.first_seen, 0);
         assert_eq!(f.last_seen, 9);
+    }
+
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().expect("test ip")
+    }
+
+    fn mac6(last: u8) -> [u8; 6] {
+        [0x02, 0x00, 0x00, 0x00, 0x00, last]
+    }
+
+    #[test]
+    fn a_new_device_is_announced_exactly_once() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(1);
+        learn_device(&mut s, m, ip("192.168.10.50"), 100, 0);
+        learn_device(&mut s, m, ip("192.168.10.50"), 200, 5);
+        assert_eq!(s.devices.len(), 1);
+        let announced: Vec<&Alert> = s.alerts.iter().filter(|a| a.kind == "new_device").collect();
+        assert_eq!(announced.len(), 1, "a second sighting must not re-announce the device");
+        assert_eq!(announced[0].severity, "alert");
+        let d = s.devices.get(&m).expect("device recorded");
+        assert_eq!((d.packets, d.bytes), (2, 300));
+        assert_eq!(d.last_seen, 5);
+    }
+
+    #[test]
+    fn broadcast_and_multicast_macs_are_not_devices() {
+        let mut s = state(&["192.168.10.200"]);
+        learn_device(&mut s, [0xff; 6], ip("192.168.10.50"), 10, 0);
+        learn_device(&mut s, [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01], ip("224.0.0.1"), 10, 0);
+        learn_device(&mut s, [0x00; 6], ip("192.168.10.51"), 10, 0);
+        assert!(s.devices.is_empty(), "broadcast, multicast and the null MAC are not hosts");
+    }
+
+    #[test]
+    fn our_own_addresses_are_not_reported_as_devices() {
+        let mut s = state(&["192.168.10.200"]);
+        learn_device(&mut s, mac6(9), ip("192.168.10.200"), 10, 0);
+        assert!(s.devices.is_empty(), "the monitor is not a device on its own LAN");
+    }
+
+    #[test]
+    fn a_silent_device_is_retired_and_alerted_once() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(2);
+        learn_device(&mut s, m, ip("192.168.10.60"), 10, 0);
+        sweep_devices(&mut s, DEVICE_IDLE_SECS - 1);
+        assert!(s.devices[&m].online, "inside the window it is still online");
+        sweep_devices(&mut s, DEVICE_IDLE_SECS + 1);
+        assert!(!s.devices[&m].online);
+        assert_eq!(
+            s.alerts.iter().filter(|a| a.kind == "device_offline").count(),
+            1,
+            "retiring a device alerts once"
+        );
+        sweep_devices(&mut s, DEVICE_IDLE_SECS + 120);
+        assert_eq!(
+            s.alerts.iter().filter(|a| a.kind == "device_offline").count(),
+            1,
+            "and does not keep alerting on every sweep"
+        );
+    }
+
+    #[test]
+    fn a_device_that_returns_is_online_again() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(3);
+        learn_device(&mut s, m, ip("192.168.10.61"), 10, 0);
+        sweep_devices(&mut s, DEVICE_IDLE_SECS + 1);
+        assert!(!s.devices[&m].online);
+        learn_device(&mut s, m, ip("192.168.10.61"), 10, DEVICE_IDLE_SECS + 10);
+        assert!(s.devices[&m].online, "traffic means it is back");
+    }
+
+    #[test]
+    fn a_device_cannot_collect_addresses_without_limit() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(4);
+        for i in 0..40 {
+            learn_device(&mut s, m, ip(&format!("192.168.10.{}", 100 + i)), 10, 0);
+        }
+        assert_eq!(s.devices[&m].ips.len(), MAX_IPS_PER_DEVICE);
     }
 
     #[test]

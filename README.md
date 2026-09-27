@@ -102,10 +102,26 @@ netwatchd --test-alert --alerts /path/to/alerts.jsonl
 tools/netwatch-notify --config ~/.config/netwatch/notify.json
 ```
 
+Alert kinds so far: `new_device` (a MAC never seen before), `device_offline` (a
+device has gone quiet for five minutes) and `capture_failed` (the monitor has
+stopped seeing traffic, which is the failure that matters most).
+
 `min_severity` (`info`, `notable`, `alert`) filters at delivery time, so raising
 it suppresses noise without touching the daemon. `--follow` keeps the notifier
 running instead of draining once; `packaging/netwatch-notify.timer` polls every
 30 seconds instead.
+
+## Devices
+
+Hosts are learned **passively** from the traffic the box already handles: the
+source MAC of each frame, plus the destination MAC when it belongs to a host, so
+a download-heavy device is noticed too. Broadcast, multicast and the daemon's own
+addresses are excluded, and each device keeps at most eight addresses.
+
+Nothing is scanned, so nothing on the network is disturbed and no scan noise is
+generated. A MAC never seen before is announced as `new_device`; a device silent
+for five minutes is retired as `device_offline` and comes back online by itself
+when it transmits again.
 
 ## Status
 
