@@ -19,6 +19,9 @@ jobs:
       - name: Build netwatchd
         run: cargo build -p netwatchd --release
 
+      - name: Test netwatchd
+        run: cargo test -p netwatchd
+
       - name: Smoke test the daemon
         run: |
           set -e

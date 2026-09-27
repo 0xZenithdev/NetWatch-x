@@ -15,8 +15,13 @@ Forked from Sniffnet v1.5.1 (`b235b9e`, 2026-09-19).
   probe at `/healthz`. No external assets, no CDN, no API keys.
 - Binds to `127.0.0.1` by default so `tailscale serve` can publish it without
   exposing it on the LAN.
-- `--demo` mode serves the dashboard without capturing, so the UI can be
-  inspected before granting any privileges.
+- `--demo` mode serves the dashboard with synthetic traffic, so the UI can be
+  inspected before granting any privileges. The addresses are documentation
+  ranges and the mode is reported as `demo`, so it cannot be mistaken for
+  capture.
+- Seven unit tests covering flow folding, per-direction accounting, key
+  stability and up/down attribution. They run without any capture privileges,
+  and CI runs them.
 - `--list` enumerates capture interfaces.
 - Errors are surfaced in the dashboard itself: a missing `CAP_NET_RAW` shows up
   in the UI with the exact `setcap` command rather than silently reporting zero

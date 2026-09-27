@@ -14,7 +14,7 @@ toolkit, no ALSA, no fontconfig, no API keys, no CDN.
 │                                                             │
 │  protocols      TCP 74%   UDP 25%   other 1%                │
 │  destinations   142.250.185.46 · 1.2 MB                     │
-│  flows          10.0.0.5:52344 → 1.1.1.1:443  TCP 84.2 KB   │
+│  conversations  TCP ↔ 142.250.185.46:443 84.2 KB ↑12.1 ↓72.1 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,6 +71,10 @@ added authentication — a live view of your server's connections is not somethi
 - **No external assets.** The page is a single embedded string: no CDN, no fonts to fetch, nothing
   that phones home.
 - **Headers only.** Snaplen 128: enough to read addresses and ports, not enough to retain content.
+- **A conversation is one row.** Both directions fold into a single entry with the endpoints in
+  canonical order, so a request and its reply cannot appear as two half-conversations. "Up" and
+  "down" are named relative to the interface's own addresses; for traffic that is merely routed
+  through, no direction is claimed rather than guessing.
 - **Read-only.** `CAP_NET_RAW` is needed to observe; nothing is ever transmitted or modified.
 
 ## Status
