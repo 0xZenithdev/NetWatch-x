@@ -140,6 +140,22 @@ fn mac_string(mac: [u8; 6]) -> String {
     )
 }
 
+/// Addresses that can belong to a host on this network: private IPv4,
+/// link-local, IPv6 unique-local and IPv6 link-local.
+///
+/// `172.67.219.2` and `172.217.112.4` are Cloudflare and Google, not private
+/// addresses — only 172.16.0.0/12 is — which is exactly the mistake live
+/// traffic caught here.
+fn is_lan_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
+        }
+    }
+}
+
 /// MACs that cannot belong to a host: broadcast, multicast, or all zero.
 fn is_host_mac(mac: [u8; 6]) -> bool {
     mac != [0u8; 6] && mac[0] & 1 == 0
@@ -153,6 +169,13 @@ fn is_host_mac(mac: [u8; 6]) -> bool {
 /// handling. Nothing has to be scanned, so nothing is disturbed on the LAN.
 fn learn_device(s: &mut State, mac: [u8; 6], ip: IpAddr, len: u64, now: u64) {
     if !is_host_mac(mac) {
+        return;
+    }
+    // A MAC may only be paired with an address on this LAN, in either direction.
+    // On traffic to or from the internet the peer MAC is the router, so pairing
+    // it with a remote address credits the router with every server the house
+    // talks to — which is what happened before this check existed.
+    if !is_lan_address(&ip) {
         return;
     }
     // Our own addresses are not a device worth reporting.
@@ -1043,6 +1066,36 @@ mod tests {
 
     fn mac6(last: u8) -> [u8; 6] {
         [0x02, 0x00, 0x00, 0x00, 0x00, last]
+    }
+
+    #[test]
+    fn only_lan_addresses_can_identify_a_host() {
+        assert!(is_lan_address(&ip("192.168.10.243")), "a real host on this LAN");
+        assert!(is_lan_address(&ip("10.0.0.5")), "10/8 is private");
+        assert!(is_lan_address(&ip("172.16.5.5")), "172.16/12 is private");
+        assert!(is_lan_address(&ip("169.254.1.1")), "link-local");
+        assert!(is_lan_address(&ip("fd00::1")), "IPv6 unique-local");
+        assert!(is_lan_address(&ip("fe80::1")), "IPv6 link-local");
+        assert!(!is_lan_address(&ip("149.154.167.92")), "Telegram is remote");
+        assert!(!is_lan_address(&ip("172.67.219.2")), "Cloudflare: 172.67 is NOT private");
+        assert!(!is_lan_address(&ip("172.217.112.4")), "Google: 172.217 is NOT private");
+        assert!(!is_lan_address(&ip("8.8.8.8")), "a public resolver");
+    }
+
+    #[test]
+    fn a_next_hop_mac_cannot_collect_remote_addresses() {
+        let mut s = state(&["192.168.10.200"]);
+        let router = mac6(7);
+        // Traffic to the internet arrives with the router's MAC and a remote
+        // address; that pair must be refused in both directions.
+        learn_device(&mut s, router, ip("149.154.167.92"), 10, 0);
+        learn_device(&mut s, router, ip("172.67.219.2"), 10, 0);
+        assert!(s.devices.is_empty(), "the router must not be credited with remote servers");
+
+        // The same MAC with a LAN address is the genuine host.
+        learn_device(&mut s, router, ip("192.168.10.1"), 10, 0);
+        assert_eq!(s.devices[&router].ips, vec![ip("192.168.10.1")]);
+        assert_eq!(s.alerts.len(), 1, "and it is announced when it is really identified");
     }
 
     #[test]
