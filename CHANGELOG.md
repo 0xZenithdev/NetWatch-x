@@ -31,6 +31,7 @@ Forked from Sniffnet v1.5.1 (`b235b9e`, 2026-09-19).
 ### Notes
 
 - The desktop application is retained and unmodified in behaviour. Its rename is
-  **compile-unverified** in this environment because building it requires the
-  GTK/ALSA/fontconfig development headers, which are not installed here. See
+  **compile-unverified** in this environment because building it requires
+  `pkg-config` and the `libasound2-dev` headers, which are not installed here.
+  It is not a GTK application and needs no fontconfig headers. See
   `docs/BUILDING.md`.

@@ -51,9 +51,14 @@ dashboard states what is wrong.
 
 ## The desktop application (Sniffnet's original GUI)
 
-Requires the full upstream toolchain — on Debian:
+On Debian:
 
 ```sh
-sudo apt install pkg-config libpcap-dev libasound2-dev libfontconfig1-dev
+sudo apt install pkg-config libpcap-dev libasound2-dev
 cargo build
 ```
+
+Three packages, and that is the whole list: `alsa-sys` is the only C library the
+desktop app links that the daemon does not. GTK is not used (the GUI is
+`winit`-based, not GTK), and `fontconfig-parser` — the only fontconfig entry in
+`Cargo.lock` — is pure Rust and needs no system headers.

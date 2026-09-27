@@ -79,8 +79,8 @@ added authentication — a live view of your server's connections is not somethi
 in rough order: per-process attribution, a searchable flow history, authentication, and IP geolocation.
 
 The original Sniffnet desktop application is retained in this repository and builds from the root
-crate. See [`docs/BUILDING.md`](docs/BUILDING.md) — the daemon needs only libpcap, while the desktop
-app needs the full GTK/ALSA/fontconfig toolchain.
+crate. See [`docs/BUILDING.md`](docs/BUILDING.md): the daemon needs libpcap and nothing else, while
+the desktop app additionally needs `pkg-config` and `libasound2-dev` for its audio dependency.
 
 ## Licence
 
