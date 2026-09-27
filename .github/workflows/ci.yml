@@ -11,10 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # The daemon needs libpcap and nothing else — no GTK, no ALSA, no fontconfig.
       - name: Install libpcap
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      # The workspace lint set is strict, so this is a real check, not a formality.
+      - name: Clippy
+        run: cargo clippy -p netwatchd --all-targets -- -D warnings
 
       - name: Build netwatchd
         run: cargo build -p netwatchd --release
