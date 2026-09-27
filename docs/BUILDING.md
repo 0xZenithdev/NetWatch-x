@@ -49,6 +49,36 @@ re-run `setcap` after each build — or install it as a systemd *system* unit wi
 Without the capability the daemon still starts and serves the dashboard, and the
 dashboard states what is wrong.
 
+## Running it as a service
+
+**Without root — a user service.** Works with the `setcap` above, needs no
+privileges to install, and survives logout because user services with lingering
+enabled are started at boot:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp packaging/netwatchd.service ~/.config/systemd/user/
+# edit ExecStart to your interface and the absolute path of the binary
+systemctl --user enable --now netwatchd.service
+loginctl enable-linger "$USER"    # start it at boot, not at login
+```
+
+The trap: systemd sets `NoNewPrivileges=true` by default for services, and with
+that flag the kernel **ignores file capabilities**. `setcap` succeeds, the
+service starts, and it captures nothing. The unit in `packaging/` sets it to
+`false` explicitly. If you write your own, do not omit it.
+
+**With root — a system service (preferred).** It grants the capability to the
+service, so there is no `setcap` step and a rebuild cannot strip it:
+
+```sh
+sudo install -m 644 packaging/netwatchd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netwatchd.service
+```
+
+Allow ~2 seconds before the dashboard has data.
+
 ## The desktop application (Sniffnet's original GUI)
 
 On Debian:

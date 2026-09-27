@@ -1,0 +1,28 @@
+[Unit]
+Description=netwatch — headless network flow monitor
+Documentation=https://github.com/0xZenithdev/NetWatch-x
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netwatchd --iface eth0 --port 8790
+Restart=always
+RestartSec=5
+
+# Grant the capture capabilities to the service rather than to the binary. With
+# setcap, a rebuild silently replaces the file and the capability is gone; here
+# it survives, and no setcap step is needed at all.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Safe for a monitor: it reads packets and serves HTTP, nothing else.
+NoNewPrivileges=true
+
+# Deliberately conservative from here down. Further hardening (ProtectSystem,
+# PrivateDevices and friends) is plausible for this program but has not been
+# tested against live capture, and shipping an untested hardening block that
+# breaks the one thing the service does would be worse than not shipping it.
+
+[Install]
+WantedBy=multi-user.target
