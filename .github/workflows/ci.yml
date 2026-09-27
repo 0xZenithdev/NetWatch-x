@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The daemon needs libpcap and nothing else — no GTK, no ALSA, no fontconfig.
+      - name: Install libpcap
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Build netwatchd
+        run: cargo build -p netwatchd --release
+
+      - name: Smoke test the daemon
+        run: |
+          set -e
+          ./target/release/netwatchd --help
+          ./target/release/netwatchd --list || true
+          ./target/release/netwatchd --demo --port 8790 &
+          DEMO=$!
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8790/healthz && break || sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8790/healthz
+          curl -sf http://127.0.0.1:8790/api/stats | head -c 200
+          curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8790/ | grep -q 200
+          curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8790/nope | grep -q 404
+          kill $DEMO
+          echo "daemon smoke test passed"
