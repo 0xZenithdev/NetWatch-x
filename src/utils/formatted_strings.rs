@@ -1,0 +1,336 @@
+use std::cmp::min;
+use std::collections::HashMap;
+use std::fmt::{Display, Write};
+use std::net::IpAddr;
+
+use crate::translations::translations_3::link_type_translation;
+use crate::translations::types::language::Language;
+use crate::utils::types::timestamp::Timestamp;
+use jiff::tz::TimeZone;
+use netwatch_packet_parser::LinkType;
+
+/// Application version number (to be displayed in gui footer)
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// /// Computes the String representing the percentage of filtered bytes/packets
+// pub fn get_percentage_string(observed: u128, filtered: u128) -> String {
+//     #[allow(clippy::cast_precision_loss)]
+//     let filtered_float = filtered as f32;
+//     #[allow(clippy::cast_precision_loss)]
+//     let observed_float = observed as f32;
+//     if format!("{:.1}", 100.0 * filtered_float / observed_float).eq("0.0") {
+//         "<0.1%".to_string()
+//     } else {
+//         format!("{:.1}%", 100.0 * filtered_float / observed_float)
+//     }
+// }
+
+#[allow(clippy::print_stdout)]
+pub fn print_cli_welcome_message() {
+    let ver = APP_VERSION;
+    print!(
+        "\n\
+╭────────────────────────────────────────────────────────────────────╮\n\
+│                                                                    │\n\
+│                           Netwatch {ver}                           │\n\
+│                                                                    │\n\
+│           → Website: https://github.com/0xZenithdev/NetWatch-x                          │\n\
+│           → GitHub:  https://github.com/0xZenithdev/NetWatch-x          │\n\
+│                                                                    │\n\
+╰────────────────────────────────────────────────────────────────────╯\n\n"
+    );
+}
+
+pub fn get_domain_from_r_dns(r_dns: String) -> String {
+    if r_dns.parse::<IpAddr>().is_ok() || r_dns.is_empty() {
+        // rDNS is equal to the corresponding IP address (can't be empty but checking it to be safe)
+        r_dns
+    } else {
+        let parts: Vec<&str> = r_dns.split('.').collect();
+        let len = parts.len();
+        if len >= 2 {
+            let last = parts.get(len - 1).unwrap_or(&"");
+            let second_last = parts.get(len - 2).unwrap_or(&"");
+            if last.len() > 3 || second_last.len() > 3 {
+                format!("{second_last}.{last}")
+            } else {
+                let third_last_opt = len.checked_sub(3).and_then(|i| parts.get(i));
+                match third_last_opt {
+                    Some(third_last) => format!("{third_last}.{second_last}.{last}"),
+                    None => format!("{second_last}.{last}"),
+                }
+            }
+        } else {
+            r_dns
+        }
+    }
+}
+
+pub fn get_socket_address(address: &IpAddr, port: Option<u16>) -> String {
+    if let Some(res) = port {
+        if address.is_ipv6() {
+            // IPv6
+            format!("[{address}]:{res}")
+        } else {
+            // IPv4
+            format!("{address}:{res}")
+        }
+    } else {
+        address.to_string()
+    }
+}
+
+pub fn get_path_termination_string(full_path: &str, i: usize) -> String {
+    let chars = full_path.chars().collect::<Vec<char>>();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let tot_len = chars.len();
+    let slice_len = min(i, tot_len);
+    let suspensions = if tot_len > i { "…" } else { "" };
+    [
+        suspensions,
+        &chars[tot_len - slice_len..].iter().collect::<String>(),
+        " ",
+    ]
+    .concat()
+}
+
+pub fn get_formatted_num_seconds(num_seconds: u128) -> String {
+    match num_seconds {
+        0..3600 => format!("{:02}:{:02}", num_seconds / 60, num_seconds % 60),
+        _ => format!(
+            "{:02}:{:02}:{:02}",
+            num_seconds / 3600,
+            (num_seconds % 3600) / 60,
+            num_seconds % 60
+        ),
+    }
+}
+
+pub fn get_formatted_timestamp(t: Timestamp) -> String {
+    let date_opt = t
+        .to_usecs()
+        .and_then(|usecs| jiff::Timestamp::from_microsecond(usecs).ok())
+        .map(|ts| TimeZone::system().to_datetime(ts));
+    if let Some(date) = date_opt {
+        date.strftime("%Y/%m/%d %H:%M:%S").to_string()
+    } else {
+        "?".to_string()
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(windows)]
+pub fn get_logs_file_path() -> Option<String> {
+    let mut conf = confy::get_configuration_file_path(crate::NETWATCH_LOWERCASE, "logs").ok()?;
+    conf.set_extension("txt");
+    Some(conf.to_str()?.to_string())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+pub fn redirect_stdout_stderr_to_file()
+-> Option<(gag::Redirect<std::fs::File>, gag::Redirect<std::fs::File>)> {
+    if let Ok(logs_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(get_logs_file_path()?)
+    {
+        return Some((
+            gag::Redirect::stdout(logs_file.try_clone().ok()?).ok()?,
+            gag::Redirect::stderr(logs_file).ok()?,
+        ));
+    }
+    None
+}
+
+pub fn clip_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    let chars = text.chars().collect::<Vec<char>>();
+    let tot_len = chars.len();
+    let slice_len = min(max_chars, tot_len);
+
+    let suspensions = if tot_len > max_chars { "…" } else { "" };
+    let slice = if tot_len > max_chars {
+        &chars[..slice_len.saturating_sub(2)]
+    } else {
+        &chars[..slice_len]
+    }
+    .iter()
+    .collect::<String>();
+
+    [slice.trim(), suspensions].concat()
+}
+
+/// Converts a MAC address in its hexadecimal form
+pub fn mac_from_dec_to_hex(mac_dec: [u8; 6]) -> String {
+    let mut mac_hex = String::with_capacity(17);
+    for n in &mac_dec {
+        let _ = write!(mac_hex, "{n:02x}:");
+    }
+    mac_hex.pop();
+    mac_hex
+}
+
+/// Used to print ICMP, IGMP, and ARP message types
+pub fn pretty_print_message_types<T: Display>(map: &HashMap<T, usize>) -> String {
+    let mut ret_val = String::new();
+
+    let mut vec: Vec<(&T, &usize)> = map.iter().collect();
+    vec.sort_by(|(_, a), (_, b)| b.cmp(a));
+
+    for (msg_type, n) in vec {
+        let _ = writeln!(ret_val, "   {msg_type} ({n})");
+    }
+    ret_val
+}
+
+/// Pretty print the link type with its description
+pub fn full_print_link_type(link_type: Option<LinkType>, language: Language) -> String {
+    let Some(link_type) = link_type else {
+        return format!("{}: -", link_type_translation(language));
+    };
+
+    format!(
+        "{}: {}",
+        link_type_translation(language),
+        link_type.description()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_formatted_num_seconds() {
+        assert_eq!(get_formatted_num_seconds(0), "00:00");
+        assert_eq!(get_formatted_num_seconds(1), "00:01");
+        assert_eq!(get_formatted_num_seconds(28), "00:28");
+        assert_eq!(get_formatted_num_seconds(59), "00:59");
+        assert_eq!(get_formatted_num_seconds(60), "01:00");
+        assert_eq!(get_formatted_num_seconds(61), "01:01");
+        assert_eq!(get_formatted_num_seconds(119), "01:59");
+        assert_eq!(get_formatted_num_seconds(120), "02:00");
+        assert_eq!(get_formatted_num_seconds(121), "02:01");
+        assert_eq!(get_formatted_num_seconds(3500), "58:20");
+        assert_eq!(get_formatted_num_seconds(3599), "59:59");
+        assert_eq!(get_formatted_num_seconds(3600), "01:00:00");
+        assert_eq!(get_formatted_num_seconds(3601), "01:00:01");
+        assert_eq!(get_formatted_num_seconds(3661), "01:01:01");
+        assert_eq!(get_formatted_num_seconds(7139), "01:58:59");
+        assert_eq!(get_formatted_num_seconds(7147), "01:59:07");
+        assert_eq!(get_formatted_num_seconds(7199), "01:59:59");
+        assert_eq!(get_formatted_num_seconds(7200), "02:00:00");
+        assert_eq!(get_formatted_num_seconds(9999), "02:46:39");
+        assert_eq!(get_formatted_num_seconds(36000), "10:00:00");
+        assert_eq!(get_formatted_num_seconds(36001), "10:00:01");
+        assert_eq!(get_formatted_num_seconds(36061), "10:01:01");
+        assert_eq!(get_formatted_num_seconds(86400), "24:00:00");
+        assert_eq!(get_formatted_num_seconds(123456789), "34293:33:09");
+        assert_eq!(
+            get_formatted_num_seconds(u128::MAX),
+            "94522879700260684295381835397713392:04:15"
+        );
+    }
+
+    #[test]
+    fn test_get_formatted_timestamp() {
+        // 2023/11/14 22:13:20 UTC: the rendered day is 14 or 15 depending on the system time zone
+        let formatted = get_formatted_timestamp(Timestamp::new(1_700_000_000, 123_456));
+        assert!(formatted.starts_with("2023/11/1"), "{formatted}");
+        assert!(
+            formatted.chars().enumerate().all(|(i, c)| match i {
+                4 | 7 => c == '/',
+                10 => c == ' ',
+                13 | 16 => c == ':',
+                _ => c.is_ascii_digit(),
+            }) && formatted.len() == 19,
+            "{formatted}"
+        );
+
+        // microseconds overflow
+        assert_eq!(get_formatted_timestamp(Timestamp::new(i64::MAX, 0)), "?");
+        assert_eq!(get_formatted_timestamp(Timestamp::new(i64::MIN, 0)), "?");
+        // out of the range of dates that can be represented
+        assert_eq!(
+            get_formatted_timestamp(Timestamp::new(1_800_000_000_000, 0)),
+            "?"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_logs_file_path() {
+        let file_path = std::path::PathBuf::from(get_logs_file_path().unwrap());
+        assert!(file_path.is_absolute());
+        assert_eq!(file_path.file_name().unwrap(), "logs.txt");
+    }
+
+    #[test]
+    fn test_get_domain_from_r_dns() {
+        let f = |s: &str| get_domain_from_r_dns(s.to_string());
+        assert_eq!(f(""), "");
+        assert_eq!(f("8.8.8.8"), "8.8.8.8");
+        assert_eq!(f("a.b.c.d"), "b.c.d");
+        assert_eq!(f("ciao.xyz"), "ciao.xyz");
+        assert_eq!(f("bye.ciao.xyz"), "ciao.xyz");
+        assert_eq!(f("ciao.bye.xyz"), "ciao.bye.xyz");
+        assert_eq!(f("hola.ciao.bye.xyz"), "ciao.bye.xyz");
+        assert_eq!(f(".bye.xyz"), ".bye.xyz");
+        assert_eq!(f("bye.xyz"), "bye.xyz");
+        assert_eq!(f("hola.ciao.b"), "ciao.b");
+        assert_eq!(f("hola.b.ciao"), "b.ciao");
+        assert_eq!(f("ciao."), "ciao.");
+        assert_eq!(f("ciao.."), "ciao..");
+        assert_eq!(f(".ciao."), "ciao.");
+        assert_eq!(f("ciao.bye."), "ciao.bye.");
+        assert_eq!(f("ciao..."), "..");
+        assert_eq!(f("..bye"), "..bye");
+        assert_eq!(f("ciao..bye"), "ciao..bye");
+        assert_eq!(f("..ciao"), ".ciao");
+        assert_eq!(f("bye..ciao"), ".ciao");
+        assert_eq!(f("."), ".");
+        assert_eq!(f(".."), "..");
+        assert_eq!(f("..."), "..");
+        assert_eq!(f("no_dots_in_this"), "no_dots_in_this");
+    }
+
+    #[test]
+    fn test_clip_text() {
+        assert_eq!(
+            clip_text("iphone-di-doofenshmirtz.local", 26),
+            "iphone-di-doofenshmirtz.…"
+        );
+        assert_eq!(clip_text("github.com", 26), "github.com");
+
+        assert_eq!(clip_text("https6789012", 13), "https6789012");
+        assert_eq!(clip_text("https67890123", 13), "https67890123");
+        assert_eq!(clip_text("https678901234", 13), "https678901…");
+        assert_eq!(clip_text("https6789012345", 13), "https678901…");
+
+        assert_eq!(clip_text("protocol with space", 13), "protocol wi…");
+        assert_eq!(clip_text("protocol90 23456", 13), "protocol90…");
+
+        assert_eq!(
+            clip_text("      \n\t    netwatch.app       ", 26),
+            "netwatch.app"
+        );
+        assert_eq!(
+            clip_text("        protocol90 23456    \n      ", 12),
+            "protocol90…"
+        );
+        assert_eq!(
+            clip_text("        protocol90 23456          ", 26),
+            "protocol90 23456"
+        );
+    }
+
+    #[test]
+    fn test_mac_from_dec_to_hex() {
+        let result = mac_from_dec_to_hex([255, 255, 10, 177, 9, 15]);
+        assert_eq!(result, "ff:ff:0a:b1:09:0f".to_string());
+        let result = mac_from_dec_to_hex([0, 0, 0, 0, 0, 0]);
+        assert_eq!(result, "00:00:00:00:00:00".to_string());
+    }
+}

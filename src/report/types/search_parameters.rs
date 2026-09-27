@@ -1,0 +1,263 @@
+use crate::countries::types::country::Country;
+use crate::networking::types::address_port_pair::AddressPortPair;
+use crate::networking::types::host::Host;
+use crate::networking::types::info_address_port_pair::InfoAddressPortPair;
+use crate::networking::types::program::Program;
+use crate::networking::types::service::Service;
+
+/// Used to express the search filters applied to GUI inspect page
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq)]
+pub struct SearchParameters {
+    /// IP address (source)
+    pub address_src: String,
+    /// Transport port (source)
+    pub port_src: String,
+    /// IP address (destination)
+    pub address_dst: String,
+    /// Transport port (destination)
+    pub port_dst: String,
+    /// Protocol
+    pub proto: String,
+    /// Service
+    pub service: String,
+    /// Country
+    pub country: String,
+    /// Domain
+    pub domain: String,
+    /// Autonomous System name
+    pub as_name: String,
+    /// Program name
+    pub program: String,
+    /// IPFIX exporter
+    pub exporter: String,
+    /// Whether to display only favorites
+    pub only_favorites: bool,
+    /// Whether to display only blacklisted
+    pub only_blacklisted: bool,
+}
+
+impl SearchParameters {
+    pub fn match_entry(
+        &self,
+        key: &AddressPortPair,
+        value: &InfoAddressPortPair,
+        r_dns_host: Option<&(String, Host)>,
+        is_favorite: bool,
+    ) -> bool {
+        // if a host-related filter is active and this address has not been resolved yet => false
+        if r_dns_host.is_none() && self.is_some_host_filter_active() {
+            return false;
+        }
+
+        for filter_input_type in FilterInputType::ALL {
+            if !filter_input_type.matches_entry(self, key, value, r_dns_host) {
+                return false;
+            }
+        }
+
+        // check favorites filter
+        if self.only_favorites && !is_favorite {
+            return false;
+        }
+
+        // check blacklisted filter
+        if self.only_blacklisted && !value.is_blacklisted {
+            return false;
+        }
+
+        // if arrived at this point all filters are satisfied
+        true
+    }
+
+    fn is_some_host_filter_active(&self) -> bool {
+        !self.country.is_empty() || !self.as_name.is_empty() || !self.domain.is_empty()
+    }
+
+    pub fn new_host_search(host: &Host) -> Self {
+        Self {
+            domain: host.domain.clone(),
+            as_name: host.asn.name.clone(),
+            country: if host.country == Country::ZZ {
+                String::new()
+            } else {
+                host.country.to_string()
+            },
+            ..SearchParameters::default()
+        }
+    }
+
+    pub fn new_service_search(service: &Service) -> Self {
+        Self {
+            service: service.to_string_with_equal_prefix(),
+            ..SearchParameters::default()
+        }
+    }
+
+    pub fn new_program_search(program: &Program) -> Self {
+        Self {
+            program: program.to_string_with_equal_prefix(),
+            ..SearchParameters::default()
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum FilterInputType {
+    AddressSrc,
+    PortSrc,
+    AddressDst,
+    PortDst,
+    Proto,
+    Service,
+    Country,
+    Domain,
+    AsName,
+    Program,
+    Exporter,
+}
+
+impl FilterInputType {
+    pub const ALL: [FilterInputType; 11] = [
+        Self::AddressSrc,
+        Self::PortSrc,
+        Self::AddressDst,
+        Self::PortDst,
+        Self::Proto,
+        Self::Service,
+        Self::Country,
+        Self::Domain,
+        Self::AsName,
+        Self::Program,
+        Self::Exporter,
+    ];
+
+    pub fn matches_entry(
+        self,
+        search_params: &SearchParameters,
+        key: &AddressPortPair,
+        value: &InfoAddressPortPair,
+        r_dns_host: Option<&(String, Host)>,
+    ) -> bool {
+        let filter_value = self.current_value(search_params).to_lowercase();
+
+        if filter_value.is_empty() {
+            return true;
+        }
+
+        let entry_value = self.entry_value(key, value, r_dns_host).to_lowercase();
+
+        if let Some(equal_filter) = filter_value.strip_prefix('=') {
+            return entry_value.eq(equal_filter);
+        }
+
+        if let Some(not_equal_filter) = filter_value.strip_prefix("!=") {
+            return !entry_value.eq(not_equal_filter);
+        }
+
+        if let Some(not_contains_filter) = filter_value.strip_prefix('!') {
+            return !entry_value.contains(not_contains_filter);
+        }
+
+        entry_value.contains(&filter_value)
+    }
+
+    pub fn current_value(self, search_params: &SearchParameters) -> &str {
+        match self {
+            FilterInputType::AddressSrc => &search_params.address_src,
+            FilterInputType::PortSrc => &search_params.port_src,
+            FilterInputType::AddressDst => &search_params.address_dst,
+            FilterInputType::PortDst => &search_params.port_dst,
+            FilterInputType::Proto => &search_params.proto,
+            FilterInputType::Service => &search_params.service,
+            FilterInputType::Country => &search_params.country,
+            FilterInputType::Domain => &search_params.domain,
+            FilterInputType::AsName => &search_params.as_name,
+            FilterInputType::Program => &search_params.program,
+            FilterInputType::Exporter => &search_params.exporter,
+        }
+    }
+
+    fn entry_value(
+        self,
+        key: &AddressPortPair,
+        value: &InfoAddressPortPair,
+        r_dns_host: Option<&(String, Host)>,
+    ) -> String {
+        match self {
+            FilterInputType::AddressSrc => key.src_ip.to_string(),
+            FilterInputType::PortSrc => {
+                if let Some(port) = key.src_port {
+                    port.to_string()
+                } else {
+                    "-".to_string()
+                }
+            }
+            FilterInputType::AddressDst => key.dst_ip.to_string(),
+            FilterInputType::PortDst => {
+                if let Some(port) = key.dst_port {
+                    port.to_string()
+                } else {
+                    "-".to_string()
+                }
+            }
+            FilterInputType::Proto => key.protocol.to_string(),
+            FilterInputType::Service => value.service.to_string(),
+            FilterInputType::Country => r_dns_host
+                .unwrap_or(&(String::new(), Host::default()))
+                .1
+                .country
+                .to_string(),
+            FilterInputType::Domain => r_dns_host
+                .unwrap_or(&(String::new(), Host::default()))
+                .0
+                .clone(),
+            FilterInputType::AsName => r_dns_host
+                .unwrap_or(&(String::new(), Host::default()))
+                .1
+                .asn
+                .name
+                .clone(),
+            FilterInputType::Program => value.program.to_string(),
+            FilterInputType::Exporter => key
+                .exporter
+                .map_or_else(|| "-".to_string(), |exporter| exporter.to_string()),
+        }
+    }
+
+    pub fn clear_search(self, search_params: &SearchParameters) -> SearchParameters {
+        let mut result = search_params.clone();
+        match self {
+            FilterInputType::AddressSrc => result.address_src = String::new(),
+            FilterInputType::PortSrc => result.port_src = String::new(),
+            FilterInputType::AddressDst => result.address_dst = String::new(),
+            FilterInputType::PortDst => result.port_dst = String::new(),
+            FilterInputType::Proto => result.proto = String::new(),
+            FilterInputType::Service => result.service = String::new(),
+            FilterInputType::Domain => result.domain = String::new(),
+            FilterInputType::Country => result.country = String::new(),
+            FilterInputType::AsName => result.as_name = String::new(),
+            FilterInputType::Program => result.program = String::new(),
+            FilterInputType::Exporter => result.exporter = String::new(),
+        }
+        result
+    }
+
+    pub fn new_search(self, search_params: &SearchParameters, new_value: &str) -> SearchParameters {
+        let mut result = search_params.clone();
+        let trimmed = new_value.trim().to_string();
+        match self {
+            FilterInputType::AddressSrc => result.address_src = trimmed,
+            FilterInputType::PortSrc => result.port_src = trimmed,
+            FilterInputType::AddressDst => result.address_dst = trimmed,
+            FilterInputType::PortDst => result.port_dst = trimmed,
+            FilterInputType::Proto => result.proto = trimmed,
+            FilterInputType::Service => result.service = trimmed,
+            FilterInputType::Domain => result.domain = trimmed,
+            FilterInputType::Country => result.country = trimmed,
+            FilterInputType::AsName => result.as_name = trimmed,
+            FilterInputType::Program => result.program = trimmed,
+            FilterInputType::Exporter => result.exporter = trimmed,
+        }
+        result
+    }
+}

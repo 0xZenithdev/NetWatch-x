@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Netwatch
+Comment=Application to comfortably monitor your network traffic
+Categories=Network;Utility;
+Icon=netwatch
+Exec=/usr/bin/netwatch
+StartupWMClass=netwatch
+Terminal=false
+Keywords=traffic;inspect;monitor;internet;network;

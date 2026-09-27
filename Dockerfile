@@ -1,0 +1,28 @@
+FROM rust:1.88-slim AS builder
+
+# Install build dependencies for both X11 and Wayland
+RUN apt-get update && apt-get install -y \
+    libpcap-dev \
+    libasound2-dev \
+    libfontconfig1-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/netwatch
+COPY . .
+
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies for both X11 and Wayland
+RUN apt-get update && apt-get install -y \
+    libpcap0.8 \
+    libasound2 \
+    libfontconfig1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/netwatch/target/release/netwatch /usr/local/bin/netwatch
+
+ENTRYPOINT ["netwatch"]

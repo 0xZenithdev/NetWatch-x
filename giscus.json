@@ -1,0 +1,9 @@
+{
+  "origins": [
+    "https://github.com/0xZenithdev/NetWatch-x"
+  ],
+  "originsRegex": [
+    "http://localhost:[0-9]+"
+  ],
+  "defaultCommentOrder": "oldest"
+}

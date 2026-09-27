@@ -1,0 +1,113 @@
+//! Module containing the entry point of application execution.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::borrow::Cow;
+
+use chart::types::traffic_chart::TrafficChart;
+use gui::pages::types::running_page::RunningPage;
+use gui::sniffer::Sniffer;
+use gui::styles::style_constants::FONT_SIZE_BODY;
+use gui::styles::types::style_type::StyleType;
+use iced::window::Position;
+#[cfg(target_os = "linux")]
+use iced::window::settings::PlatformSpecific;
+use iced::{Font, Pixels, application, window};
+use networking::types::data_representation::ByteMultiple;
+use networking::types::info_traffic::InfoTraffic;
+use networking::types::service::Service;
+use netwatch_packet_parser::Protocol;
+use translations::types::language::Language;
+use utils::formatted_strings::print_cli_welcome_message;
+
+use crate::gui::sniffer::FONT_FAMILY_NAME;
+use crate::gui::styles::style_constants::{ICONS_BYTES, SARASA_MONO_BYTES};
+use crate::gui::types::conf::CONF;
+
+mod chart;
+mod cli;
+mod countries;
+mod gui;
+mod mmdb;
+mod networking;
+mod notifications;
+mod report;
+mod translations;
+mod utils;
+
+pub const NETWATCH_LOWERCASE: &str = "netwatch";
+pub const NETWATCH_TITLECASE: &str = "Netwatch";
+
+const WINDOW_ICON: &[u8] = include_bytes!("../resources/logos/raw/icon.png");
+
+/// Entry point of application execution
+///
+/// It initializes variables and loads configuration parameters
+pub fn main() -> iced::Result {
+    #[cfg(all(windows, not(debug_assertions)))]
+    let _gag1: gag::Redirect<std::fs::File>;
+    #[cfg(all(windows, not(debug_assertions)))]
+    let _gag2: gag::Redirect<std::fs::File>;
+    #[cfg(all(windows, not(debug_assertions)))]
+    if let Some((gag1, gag2)) = utils::formatted_strings::redirect_stdout_stderr_to_file() {
+        _gag1 = gag1;
+        _gag2 = gag2;
+    }
+
+    let conf = CONF.clone();
+    let args = cli::Args::handle();
+
+    #[cfg(debug_assertions)]
+    {
+        // kill the main thread as soon as a secondary thread panics
+        let orig_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            // invoke the default handler and exit the process
+            orig_hook(panic_info);
+            std::process::exit(1);
+        }));
+    }
+
+    print_cli_welcome_message();
+
+    let size = conf.window.size();
+    let position = Position::Specific(conf.window.position());
+
+    application(
+        move || (Sniffer::new(conf.clone()), args.get_boot_task_chain()),
+        Sniffer::update,
+        Sniffer::view,
+    )
+    .title(NETWATCH_TITLECASE)
+    .settings(iced::Settings {
+        // id needed for Linux Wayland; should match StartupWMClass in .desktop file; see issue #292
+        id: Some(String::from(NETWATCH_LOWERCASE)),
+        fonts: vec![Cow::Borrowed(SARASA_MONO_BYTES), Cow::Borrowed(ICONS_BYTES)],
+        default_font: Font::with_name(FONT_FAMILY_NAME),
+        default_text_size: Pixels(FONT_SIZE_BODY),
+        antialiasing: true,
+        vsync: true,
+    })
+    .window(window::Settings {
+        size, // start size
+        position,
+        min_size: None, // Some(ConfigWindow::MIN_SIZE.to_size()), // min size allowed
+        max_size: None,
+        visible: true,
+        resizable: true,
+        decorations: true,
+        transparent: false,
+        icon: window::icon::from_file_data(WINDOW_ICON, None).ok(),
+        #[cfg(target_os = "linux")]
+        platform_specific: PlatformSpecific {
+            application_id: String::from(NETWATCH_LOWERCASE),
+            ..PlatformSpecific::default()
+        },
+        exit_on_close_request: false,
+        ..Default::default()
+    })
+    .subscription(Sniffer::subscription)
+    .theme(Sniffer::theme)
+    .scale_factor(Sniffer::scale_factor)
+    .run()
+}

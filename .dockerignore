@@ -1,0 +1,19 @@
+# Ignore everything
+*
+
+# Explicitly allow files
+!src/**/*.rs
+!lib/**/*.rs
+!lib/**/Cargo.toml
+!lib/**/README.md
+!build.rs
+!Cargo.toml
+!Cargo.lock
+!Dockerfile
+!services.txt
+!resources/embedded_icons/**/*.svg
+!resources/DB/*.mmdb
+!resources/fonts/subset/*.ttf
+!resources/logos/raw/icon.png
+!resources/packaging/windows/graphics/sniffnet.ico
+!resources/sounds/*.mp3
