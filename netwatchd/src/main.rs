@@ -460,7 +460,13 @@ fn capture_loop(iface: &str, state: &Arc<Mutex<State>>) {
         match cap.next_packet() {
             Ok(packet) => ingest(packet.data, state),
             Err(pcap::Error::NoMorePackets) => std::thread::sleep(Duration::from_millis(40)),
-            Err(pcap::Error::TimeoutExpired) => {}
+            // BOTH empty-poll outcomes need a sleep. In NON-BLOCKING mode libpcap reports an empty
+            // buffer as TimeoutExpired (0) -- NoMorePackets (-2) is what a savefile returns, so on a
+            // live non-blocking capture this arm is the one that gets hit, and an empty arm spins the
+            // thread flat out. Measured 6 Oct 2026: 8d22h of CPU time on one thread while the
+            // interface carried 81 packets/second, i.e. a full core burnt on an idle LAN. A 5 ms
+            // pause costs ~1% of a core and still drains 81 pps with no backlog.
+            Err(pcap::Error::TimeoutExpired) => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => return set_error(state, &friendly(&e.to_string())),
         }
         if last_stats.elapsed() >= Duration::from_secs(2) {
