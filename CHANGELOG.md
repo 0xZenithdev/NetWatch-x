@@ -27,6 +27,41 @@ Forked from Sniffnet v1.5.1 (`b235b9e`, 2026-09-19).
   in the UI with the exact `setcap` command rather than silently reporting zero
   traffic.
 
+### Added
+
+- Uptime history, daily traffic budgets, per-device notification rules and
+  long-term retention, all in one pass:
+  - `--history <PATH>` keeps a SQLite file (WAL, `synchronous=NORMAL`) with one
+    row per device per UTC day — bytes each way, packets, seconds online,
+    sessions — plus closed sessions. `--history-days` (default 365) bounds it.
+    The keeper flushes once every 30 seconds in a single transaction, and only
+    for devices whose counters moved, so the cost is proportional to devices and
+    never to packets.
+  - Each device carries a daily budget in gigabytes, set from its page. Crossing
+    it raises one `quota_exceeded` alert for the day, from the same counter the
+    page shows.
+  - Each device carries its own rule for being interrupted: `default`, `quiet`
+    (only what needs action) or `never`. The rule is applied where the alert is
+    raised and recorded on the alert, so the dashboard and the spool keep every
+    fact while the notifier skips what is marked `muted`.
+  - `/api/history?days=30` serves the kept days and per-device uptime; the
+    overview draws the last 30 days and each device page draws its own.
+- `tools/netwatch-notify` gains a `quota_exceeded` label, an `include_muted`
+  setting, and skips alerts a device's own rule kept quiet.
+
+### Fixed
+
+- Byte accounting in `attribute` used the transport payload length while the
+  device totals used the frame length, so per-direction counters and therefore
+  budgets silently counted less than the dashboard's own totals. Both now use
+  one frame length, and a test covers it.
+- The "ports it used" list recorded whichever end happened to be the source,
+  which for a client meant its ephemeral port (51422) rather than the service it
+  used (443). The port that is not an ephemeral client port is the one kept.
+- A rejected write answered `200 OK` with an error body. It answers `400`.
+- `--devices` was missing from the shipped unit, so a restart re-learned the
+  whole network and re-announced it as new.
+
 ### Changed
 
 - Renamed from Sniffnet to Netwatch throughout (see `NOTICE.md`).

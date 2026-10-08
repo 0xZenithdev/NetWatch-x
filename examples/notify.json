@@ -3,6 +3,16 @@
   "chat_id": "PASTE_CHAT_ID",
   "api_base": "https://api.telegram.org",
   "spool": "/var/lib/netwatch/alerts.jsonl",
-  "state": "~/.local/state/netwatch-notify.json",
-  "min_severity": "notable"
+  "state": "/var/lib/netwatch/notify-state.json",
+  "min_severity": "notable",
+  "max_age_hours": 24,
+  "muted_kinds": [],
+  "timezone": "GMT+3",
+  "notes": [
+    "min_severity: info sends everything, notable skips the background, alert sends only what needs a look.",
+    "muted_kinds: silence one rule without touching the daemon, e.g. [\"device_back_online\", \"new_peer\"].",
+    "max_age_hours: do not deliver anything older than this, however long the spool has been unattended.",
+    "timezone is appended to the timestamp so it is unambiguous when read away from the box.",
+    "Run `netwatch-notify --config <this file> --explain` to see exactly what would be delivered."
+  ]
 }

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""build-oui — regenerate netwatchd's vendor table from the IEEE registry.
+
+The daemon identifies the maker of a device from the first three bytes of its
+MAC address. That mapping is the IEEE's public registry, which is far too large
+to embed verbatim (about 4 MB) and changes slowly, so it is fetched, trimmed and
+committed as a data asset that the daemon embeds at compile time.
+
+  tools/build-oui --out netwatchd/assets/oui.csv
+
+Output: one `AABBCC,Vendor` line per assignment, sorted by prefix, vendor names
+trimmed of legal suffixes and capped in length. Nothing about this network ends
+up in the file; it is public registry data either way.
+
+Regenerate only when the vendor table needs refreshing — the daemon ships the
+committed file and needs no network at build or run time.
+"""
+
+import argparse
+import csv
+import io
+import os
+import re
+import sys
+import urllib.request
+
+REGISTRY = "https://standards-oui.ieee.org/oui/oui.csv"
+UA = "netwatch/1.0"
+MAX_VENDOR = 30
+
+# Legal boilerplate that carries no information for a human reading a device list.
+SUFFIXES = [
+    "co., ltd.", "co.,ltd.", "co. ltd.", "co ltd", "coltd", ", ltd.", " ltd.", " ltd",
+    "ltd.", ", inc.", " inc.", " inc", " incorporated", ", corp.", " corp.", " corporation",
+    ", llc", " llc", " limited", " pte", " pte.", " gmbh", " s.a.", " s.a", " s.l.",
+    " s.l", " a/s", " oy", " ab", " bv", " b.v.", " nv", " n.v.", " ag", " s.p.a.",
+    " srl", " s.r.l.", " k.k.", " kk", " kabushiki kaisha", " corp", " holdings",
+    " group", " international", " technology", " technologies", " tech.", " tech",
+    " electronic", " electronics", " communication", " communications", " network",
+    " networks", " systems", " system", " solutions", " industries", " industrial",
+    " enterprise", " company", " research", " semiconductor", " digital", " computer",
+    " information", " service", " services", " products", " manufacturing", " science",
+]
+
+
+def shorten(name: str) -> str:
+    """Cut a registry name down to the part a person recognises."""
+    cleaned = name.strip().strip('"')
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return ""
+    # The registry repeats the address after the name in some rows; the name is
+    # whatever precedes the first comma-plus-country-code pattern.
+    for suffix in SUFFIXES:
+        if cleaned.lower().endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip().rstrip(",").strip()
+            break
+    cleaned = re.sub(r"[,;]+$", "", cleaned).strip()
+    if len(cleaned) > MAX_VENDOR:
+        cleaned = cleaned[:MAX_VENDOR].rstrip(" ,;-")
+    return cleaned
+
+
+def fetch(url: str) -> str:
+    # The registry answers 418 unless the User-Agent looks like a plain client
+    # token ("netwatch/1.0" is accepted, "Mozilla/5.0" and python-urllib are not).
+    # It is the same public CSV either way.
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def build(text: str) -> list[tuple[str, str]]:
+    rows = []
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        assignment = (row.get("Assignment") or "").strip().upper()
+        vendor = shorten(row.get("Organization Name") or "")
+        if len(assignment) != 6 or not vendor:
+            continue
+        if any(c not in "0123456789ABCDEF" for c in assignment):
+            continue
+        rows.append((assignment, vendor))
+    rows.sort()
+    return rows
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Regenerate the embedded OUI vendor table.")
+    parser.add_argument("--out", default="netwatchd/assets/oui.csv")
+    parser.add_argument("--source", help="read a local copy instead of fetching")
+    args = parser.parse_args()
+
+    try:
+        text = open(args.source).read() if args.source else fetch(REGISTRY)
+    except OSError as exc:
+        sys.exit(f"cannot read the registry: {exc}")
+
+    rows = build(text)
+    if len(rows) < 1000:
+        sys.exit(f"refusing to write: only {len(rows)} rows parsed, the source looks wrong")
+
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with open(args.out, "w") as fh:
+        fh.write("# IEEE MA-L registry, trimmed: prefix,vendor. See NOTICE.md.\n")
+        for assignment, vendor in rows:
+            fh.write(f"{assignment},{vendor}\n")
+
+    vendors = {vendor for _, vendor in rows}
+    size = os.path.getsize(args.out)
+    print(f"{len(rows)} prefixes, {len(vendors)} distinct vendors, {size / 1024:.0f} KB -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

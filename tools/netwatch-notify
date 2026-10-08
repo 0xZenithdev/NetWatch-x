@@ -12,11 +12,17 @@ capture, and one bad recipient cannot stall the monitor.
   netwatch-notify --config ... --follow                       # stay running
   netwatch-notify --config ... --test                         # send a test message
   netwatch-notify --config ... --dry-run                      # print, send nothing
+  netwatch-notify --config ... --explain                      # what would be delivered
 
 Delivery is at-least-once: the read offset is advanced only after Telegram has
 accepted the message, so a failure retries instead of losing the alert. A crash
 between sending and saving can therefore duplicate one alert. That is the right
 trade for security alerts, and it is stated here rather than left implicit.
+
+The first run does NOT replay history. A monitor that has been spooling for a
+week would otherwise deliver hundreds of stale alerts the moment it is switched
+on, which trains the reader to ignore the channel. Pass --replay to send the
+backlog deliberately; --max-age-hours (default 24) bounds even that.
 """
 
 import argparse
@@ -29,9 +35,24 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_CONFIG = "~/.config/netwatch/notify.json"
-DEFAULT_STATE = "~/.local/state/netwatch-notify.json"
+DEFAULT_STATE = "/var/lib/netwatch/notify-state.json"
 SEVERITIES = {"info": 1, "notable": 2, "alert": 3}
 PER_MESSAGE_PAUSE = 1.1  # Telegram allows about 30 messages a second; be polite
+
+# How an alert reads to a person, rather than what the daemon calls it.
+KIND_LABELS = {
+    "new_device": "new device on the network",
+    "device_offline": "device gone quiet",
+    "quota_exceeded": "over its daily budget",
+    "device_back_online": "device is back",
+    "address_change": "device changed address",
+    "mac_conflict": "two devices using one address",
+    "new_peer": "device contacted somewhere new",
+    "traffic_spike": "unusual amount of traffic",
+    "capture_failed": "capture has stopped",
+    "test": "test",
+}
+MARKS = {"alert": "\N{POLICE CARS REVOLVING LIGHT}", "notable": "\N{WARNING SIGN}", "info": "\N{INFORMATION SOURCE}"}
 
 
 def load_config(path):
@@ -46,8 +67,15 @@ def load_config(path):
     config.setdefault("spool", "/var/lib/netwatch/alerts.jsonl")
     config.setdefault("state", DEFAULT_STATE)
     config.setdefault("min_severity", "info")
+    config.setdefault("max_age_hours", 24)
+    config.setdefault("muted_kinds", [])
+    # Alerts a device's own rule kept quiet are skipped unless this is on.
+    config.setdefault("include_muted", False)
+    config.setdefault("timezone", None)
     if config["min_severity"] not in SEVERITIES:
         sys.exit(f"min_severity must be one of {', '.join(SEVERITIES)}")
+    if not isinstance(config["muted_kinds"], list):
+        sys.exit("muted_kinds must be a list of alert kinds")
     return config
 
 
@@ -68,21 +96,39 @@ def save_state(path, state):
         os.makedirs(parent, exist_ok=True)
     tmp = full + ".tmp"
     with open(tmp, "w") as fh:
-        json.dump(state, fh)
+        json.dump(state, fh, indent=2)
     os.replace(tmp, full)
 
 
-def format_alert(alert):
-    marks = {"alert": "\N{POLICE CARS REVOLVING LIGHT}", "notable": "\N{WARNING SIGN}", "info": "\N{INFORMATION SOURCE}"}
-    mark = marks.get(alert.get("severity", ""), "\N{BULLET}")
+def format_alert(alert, tz=None):
+    """A short, line-separated fact. Not prose: this is read on a phone.
+
+    The device's friendly name is used when there is one, and the hardware
+    address is always shown, so an alert is identifiable even after a rename.
+    """
+    severity = alert.get("severity", "info")
+    mark = MARKS.get(severity, "\N{BULLET}")
+    kind = alert.get("kind", "event")
+    title = KIND_LABELS.get(kind, kind.replace("_", " "))
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert.get("ts", 0)))
-    return "\n".join(
-        [
-            f"{mark} {alert.get('subject', '(no subject)')}",
-            f"{alert.get('kind', 'event')} · {when}",
-            alert.get("detail", ""),
-        ]
-    ).strip()
+    if tz:
+        when = f"{when} {tz}"
+
+    name = alert.get("name")
+    subject = alert.get("subject", "")
+    lines = [f"{mark} netwatch — {title}"]
+    if name and subject and name != subject:
+        lines.append(f"{name} ({subject})")
+    elif subject:
+        lines.append(subject)
+    detail = alert.get("detail", "")
+    if detail:
+        lines.append(detail)
+    address = alert.get("address")
+    if address and address not in detail:
+        lines.append(f"address {address}")
+    lines.append(f"{when} · {severity}")
+    return "\n".join(lines).strip()
 
 
 def send(config, text):
@@ -96,7 +142,12 @@ def send(config, text):
         )
     url = f"{config['api_base'].rstrip('/')}/bot{token}/sendMessage"
     body = urllib.parse.urlencode(
-        {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+        {
+            "chat_id": chat,
+            "text": text,
+            "disable_web_page_preview": "true",
+            "disable_notification": "false",
+        }
     ).encode()
     request = urllib.request.Request(url, data=body)
     try:
@@ -134,28 +185,84 @@ def read_new(config, state):
     return alerts
 
 
+def worth_sending(config, alert, floor, newest):
+    """Filtering happens here, at delivery, so changing what you care about never
+    means touching the daemon or its history."""
+    if SEVERITIES.get(alert.get("severity", "info"), 1) < floor:
+        return False, "below min_severity"
+    if alert.get("kind") in config["muted_kinds"]:
+        return False, "kind is muted in the config"
+    # The device's own rule was applied by the daemon, which records it on the
+    # alert. Respecting it here keeps the decision in exactly one place.
+    if alert.get("muted") and not config.get("include_muted"):
+        return False, "the device is set to quiet or never"
+    max_age = int(config.get("max_age_hours") or 0)
+    if max_age:
+        age_hours = (newest - alert.get("ts", 0)) / 3600.0
+        if age_hours > max_age:
+            return False, f"older than {max_age}h"
+    return True, ""
+
+
 def drain(config, state, dry_run, verbose):
+    newest = time.time()
     alerts = read_new(config, state)
     floor = SEVERITIES[config["min_severity"]]
     sent = 0
     for alert in alerts:
-        if SEVERITIES.get(alert.get("severity", "info"), 1) < floor:
-            if verbose:
-                print(f"skipped (below {config['min_severity']}): {alert.get('subject')}")
+        ok, reason = worth_sending(config, alert, floor, newest)
+        if not ok:
+            if verbose and reason:
+                print(f"skipped ({reason}): {alert.get('kind')} {alert.get('subject', '')}")
             continue
-        text = format_alert(alert)
+        text = format_alert(alert, config.get("timezone"))
         if dry_run:
             print(f"--- would send ---\n{text}")
         else:
             send(config, text)
             state["sent"] = state.get("sent", 0) + 1
             if verbose:
-                print(f"sent: {alert.get('subject')}")
+                print(f"sent: {alert.get('kind')} {alert.get('subject', '')}")
             time.sleep(PER_MESSAGE_PAUSE)
         sent += 1
     if not dry_run:
         save_state(config["state"], state)
     return sent
+
+
+def explain(config):
+    """Say exactly what would be delivered, without sending anything."""
+    floor = SEVERITIES[config["min_severity"]]
+    print(f"spool          {os.path.expanduser(config['spool'])}")
+    print(f"state          {os.path.expanduser(config['state'])}")
+    print(f"minimum        {config['min_severity']} (and above)")
+    print(f"maximum age    {config['max_age_hours']}h old")
+    muted = config["muted_kinds"] or ["nothing"]
+    print(f"muted kinds    {', '.join(muted)}")
+    print("delivery:")
+    for kind, label in KIND_LABELS.items():
+        severity = {
+            "new_device": "alert",
+            "device_offline": "notable",
+            "quota_exceeded": "notable",
+            "device_back_online": "info",
+            "address_change": "notable",
+            "mac_conflict": "alert",
+            "new_peer": "info",
+            "traffic_spike": "notable",
+            "capture_failed": "alert",
+            "test": "info",
+        }.get(kind, "info")
+        if kind in config["muted_kinds"]:
+            verdict = "muted in config"
+        elif kind == "quota_exceeded":
+            verdict = "per device budget"
+        elif SEVERITIES[severity] < floor:
+            verdict = f"no (severity {severity} below {config['min_severity']})"
+        else:
+            verdict = "yes"
+        print(f"  {kind:20s} {severity:8s} {verdict}   — {label}")
+    return 0
 
 
 def main():
@@ -165,6 +272,9 @@ def main():
     parser.add_argument("--interval", type=float, default=15.0, help="seconds between passes with --follow")
     parser.add_argument("--test", action="store_true", help="send one test message and exit")
     parser.add_argument("--dry-run", action="store_true", help="print what would be sent")
+    parser.add_argument("--explain", action="store_true", help="show the filtering rules and exit")
+    parser.add_argument("--replay", action="store_true",
+                        help="deliver from the start of the spool (default: a first run starts at the end)")
     parser.add_argument("--api-base", help="override the Telegram API base (for testing)")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -174,18 +284,33 @@ def main():
         config["api_base"] = args.api_base
     verbose = not args.quiet
 
+    if args.explain:
+        return explain(config)
+
     if args.test:
         if args.dry_run:
             print("--- would send ---\nnetwatch-notify test message")
             return 0
         try:
-            send(config, "netwatch-notify test message — delivery is wired up.")
+            send(config, "\N{BULLET} netwatch — test\nIf you can read this, delivery is wired up.")
         except RuntimeError as exc:
             sys.exit(f"test failed: {exc}")
         print("test message accepted by Telegram")
         return 0
 
     state = load_state(config["state"])
+    first_run = not os.path.exists(os.path.expanduser(config["state"]))
+    if first_run and not args.replay:
+        # Do not replay a week of history the moment delivery is switched on.
+        path = os.path.expanduser(config["spool"])
+        if os.path.exists(path):
+            size = os.path.getsize(path)
+            state["offset"] = size
+            print(f"first run: skipping {size} bytes of existing spool ({config['spool']})")
+            print("  pass --replay to deliver the backlog deliberately")
+            if not args.dry_run:
+                save_state(config["state"], state)
+
     if not args.follow:
         try:
             count = drain(config, state, args.dry_run, verbose)

@@ -7,7 +7,16 @@ Wants=network-online.target
 [Service]
 Type=simple
 StateDirectory=netwatch
-ExecStart=/usr/local/bin/netwatchd --iface eth0 --port 8790 --alerts /var/lib/netwatch/alerts.jsonl
+# --devices is the inventory: names you give, trust levels, review state and the
+# per-device traffic history. Without it every restart re-announces the whole
+# network as new, which is exactly the behaviour that makes an alert channel
+# useless, so it is passed explicitly rather than left to a default.
+# --history is the long-term record: one row per device per day plus closed
+# sessions, so uptime and volume survive a restart. --history-days bounds it.
+ExecStart=/usr/local/bin/netwatchd --iface eth0 --port 8790 \
+    --alerts /var/lib/netwatch/alerts.jsonl \
+    --devices /var/lib/netwatch/devices.json \
+    --history /var/lib/netwatch/history.db --history-days 365
 Restart=always
 RestartSec=5
 

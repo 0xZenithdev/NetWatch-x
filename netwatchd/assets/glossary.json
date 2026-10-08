@@ -1,0 +1,492 @@
+[
+  {
+    "term": "Packet",
+    "short": "One chunk of data sent across the network.",
+    "body": "Everything on a network travels as packets — small pieces of a message, each carrying who sent it, who it is for, and a piece of the data. Netwatch counts them but never keeps what is inside them.",
+    "see": [
+      "Frame",
+      "Capture",
+      "Snaplen"
+    ]
+  },
+  {
+    "term": "Frame",
+    "short": "A packet as it exists on the wire, with hardware addresses attached.",
+    "body": "A frame is a packet plus the local delivery information — the hardware addresses of the two network cards involved. Systems like this one read frames, because that is what arrives at a network interface.",
+    "see": [
+      "Packet",
+      "MAC address"
+    ]
+  },
+  {
+    "term": "Flow",
+    "short": "One conversation between two addresses and their ports.",
+    "body": "A flow is everything sent between the same two endpoints: your laptop and 1.1.1.1 over port 443, for example. Both directions are counted in one flow, so a request and its reply never appear as two separate rows. Also called a conversation.",
+    "see": [
+      "Port",
+      "Up and down"
+    ]
+  },
+  {
+    "term": "Capture",
+    "short": "Reading frames off a network interface in order to observe them.",
+    "body": "Netwatch puts the network card into a mode where it hands over every frame it sees, and reads them one at a time. Nothing is written back to the network — this is read-only. Capture needs special permission from the operating system, which is what CAP_NET_RAW is.",
+    "see": [
+      "CAP_NET_RAW",
+      "Promiscuous mode",
+      "Snaplen"
+    ]
+  },
+  {
+    "term": "Snaplen",
+    "short": "How many bytes of each frame are kept — here, 128.",
+    "body": "Netwatch asks the operating system for only the first 128 bytes of every frame. That is enough to read all the addresses, ports and flags, and not enough to contain what anybody typed, so nothing private can be stored by accident. It also means a name that appears later in a large DNS answer is simply not visible.",
+    "see": [
+      "Capture",
+      "Packet"
+    ]
+  },
+  {
+    "term": "CAP_NET_RAW",
+    "short": "The Linux permission required to read frames off the network.",
+    "body": "A normal program cannot see other programs' traffic, which is a security feature. Reading the network interface directly requires the CAP_NET_RAW capability. If Netwatch has not got it, it still runs and still serves the dashboard — it just cannot see anything, and it says so plainly rather than showing empty graphs.",
+    "see": [
+      "Capture",
+      "Interface"
+    ]
+  },
+  {
+    "term": "Interface",
+    "short": "The network card Netwatch is reading from.",
+    "body": "A machine can have several network interfaces — wired, wireless, virtual. Netwatch watches exactly one, named here as the interface. On this machine it is enp2s0, the wired card that carries the local network.",
+    "see": [
+      "Capture",
+      "Gateway"
+    ]
+  },
+  {
+    "term": "MAC address",
+    "short": "The hardware address burned into a network chip, like 04:ea:56:1a:2b:3c.",
+    "body": "Every network device has an address identifying the hardware itself, assigned by whoever made the chip. Unlike an IP address, it does not normally change. It is the only stable name a device has, which is why Netwatch identifies devices by their MAC address and treats IP addresses as something a device merely happens to be using today.",
+    "see": [
+      "IP address",
+      "OUI prefix",
+      "Randomised address"
+    ]
+  },
+  {
+    "term": "Randomised address",
+    "short": "A deliberately fake MAC address that phones and laptops rotate.",
+    "body": "Modern phones and laptops invent a new hardware address for each network, so they cannot be tracked from shop to shop. On your own network this means the same phone can look like a brand-new device every day, and it will never have a maker in the registry. Netwatch flags these rather than pretending to identify them.",
+    "see": [
+      "MAC address",
+      "OUI prefix",
+      "Review queue"
+    ]
+  },
+  {
+    "term": "OUI prefix",
+    "short": "The first three bytes of a real MAC address, which identify the maker.",
+    "body": "The IEEE hands out blocks of hardware addresses to manufacturers, and publishes the list. The first three bytes — 04:ea:56, say — are enough to say that Intel made the chip. Netwatch carries that public list offline, so no lookup leaves this machine. A randomised address has no maker by definition, so none is claimed.",
+    "see": [
+      "MAC address",
+      "Randomised address"
+    ]
+  },
+  {
+    "term": "IP address",
+    "short": "The address a device uses to talk on a network, like 192.168.10.51.",
+    "body": "IP addresses are handed out by your router and can change. Netwatch records every address it has seen a device use, with the times, because a device changing address is worth knowing about.",
+    "see": [
+      "LAN",
+      "DHCP",
+      "MAC address"
+    ]
+  },
+  {
+    "term": "LAN",
+    "short": "Your local network — the devices in the house.",
+    "body": "The private addresses inside your home network (10.x.x.x, 172.16–31.x.x and 192.168.x.x) as opposed to anything on the internet. Netwatch only ever credits a device with a LAN address; internet addresses belong to servers out there and to the router in the middle.",
+    "see": [
+      "IP address",
+      "Gateway"
+    ]
+  },
+  {
+    "term": "Link-local",
+    "short": "A self-assigned address used before DHCP answers, or when it never does.",
+    "body": "Addresses like 169.254.x.x and fe80:: are claimed by a device for itself, usually while it is waiting for the router to give it a real one. Seeing one often means a device that failed to get a proper address.",
+    "see": [
+      "IP address",
+      "DHCP"
+    ]
+  },
+  {
+    "term": "IPv6",
+    "short": "The newer addressing scheme; devices often have one alongside IPv4.",
+    "body": "Many devices carry both an IPv4 (192.168.x.x) and an IPv6 address at the same time, so one device can appear to have several addresses. That is normal, not duplication.",
+    "see": [
+      "IP address",
+      "LAN"
+    ]
+  },
+  {
+    "term": "ARP",
+    "short": "The shout a device makes to ask who owns an IP address.",
+    "body": "Before sending anything, a device asks the network \"who has 192.168.10.1?\" and gets back a hardware address. Netwatch never sends these — it only observes the answers. Two different devices answering for one address is the classic sign of address spoofing, which is why Netwatch reports it.",
+    "see": [
+      "MAC conflict",
+      "MAC address"
+    ]
+  },
+  {
+    "term": "DHCP",
+    "short": "The service on your router that hands out IP addresses.",
+    "body": "When a device joins, it asks for an address and the router leases it one, usually for hours or days. This is why a device's address changes: it is the router deciding, not something wrong. Addresses also get handed from one device to another, which is the usual explanation for a MAC conflict.",
+    "see": [
+      "IP address",
+      "MAC conflict"
+    ]
+  },
+  {
+    "term": "DNS",
+    "short": "The service that turns a name like example.com into an address.",
+    "body": "Every time a device visits a name, it asks a DNS server for the address first. Those questions are normally sent in plain text, so they can be read — which is how Netwatch can show that a device asked for a video site without ever seeing the video.",
+    "see": [
+      "Encrypted DNS",
+      "mDNS"
+    ]
+  },
+  {
+    "term": "Encrypted DNS",
+    "short": "DNS over HTTPS or TLS — the same question, hidden.",
+    "body": "Increasingly devices hide their name lookups inside ordinary encrypted traffic, so nobody in the middle can read them. Netwatch cannot see those names at all. A device showing no domain names may simply be using encrypted DNS rather than talking to nothing.",
+    "see": [
+      "DNS",
+      "HTTPS"
+    ]
+  },
+  {
+    "term": "mDNS",
+    "short": "Name sharing between devices on your own network, using .local names.",
+    "body": "Printers, televisions and speakers announce themselves to the local network with names ending in .local, using no central server. When Netwatch sees one, it offers it as a suggested name for that device — a suggestion, never a decision.",
+    "see": [
+      "DNS",
+      "Device name"
+    ]
+  },
+  {
+    "term": "Port",
+    "short": "A number that says which service on a device is being used.",
+    "body": "Port 443 is encrypted web traffic, 53 is DNS, 5353 is local discovery, 22 is remote login. The port tells you what a device is doing in a way an address cannot, which is why the dashboard shows them with names attached.",
+    "see": [
+      "Flow",
+      "Service"
+    ]
+  },
+  {
+    "term": "Service",
+    "short": "The plain-language name for a port, like \"https\" for 443.",
+    "body": "Port numbers are meaningless to most people, so the dashboard labels the common ones. A blank label means the port is not one of the well-known ones — that is all it means, not that something is wrong.",
+    "see": [
+      "Port"
+    ]
+  },
+  {
+    "term": "HTTPS",
+    "short": "Encrypted web traffic — nearly everything these days.",
+    "body": "Almost all traffic on a modern network is encrypted, using port 443. Nobody in the middle can read it, which is exactly the point. It also sets an honest limit on what a monitor can know: with almost everything encrypted, the useful information is who is talking to whom, how much, and how often — not what was said.",
+    "see": [
+      "TLS",
+      "Packet"
+    ]
+  },
+  {
+    "term": "TCP and UDP",
+    "short": "The two ways data is carried; TCP is reliable, UDP is quick.",
+    "body": "TCP checks that everything arrived and puts it back in order, which is why web pages, downloads and logins use it. UDP just sends and hopes, which suits calls, games, video and name lookups. A flow is always one or the other.",
+    "see": [
+      "Flow",
+      "STUN"
+    ]
+  },
+  {
+    "term": "STUN and TURN",
+    "short": "Helper traffic for voice and video calls, on ports 3478 and 5349.",
+    "body": "Devices use these to work out how to reach each other through the router. Seeing port 3478 usually means a call — WhatsApp, Signal, a video meeting — rather than anything worrying.",
+    "see": [
+      "Port",
+      "UDP"
+    ]
+  },
+  {
+    "term": "SSDP and UPnP",
+    "short": "The chatter smart-home gadgets use to find each other.",
+    "body": "Sent as broadcasts on port 1900, these announcements are how a phone finds a television or a speaker. They are frequent and completely mundane, so Netwatch does not treat broadcast or multicast traffic as a device's conversation.",
+    "see": [
+      "Broadcast and multicast",
+      "Port"
+    ]
+  },
+  {
+    "term": "Broadcast and multicast",
+    "short": "One message addressed to everything, or to a group.",
+    "body": "Some traffic is not aimed at one device: it goes to every device on the network, or to a group of them. Netwatch does not list these as destinations, because a device cannot really have a conversation with a group address.",
+    "see": [
+      "SSDP and UPnP",
+      "Flow"
+    ]
+  },
+  {
+    "term": "Gateway",
+    "short": "The device that connects your network to the internet.",
+    "body": "Usually your router. Because this machine sits in that path, it sees not only its own traffic but everything belonging to devices on the network — which is why a passive monitor here can see the whole house. If it were not in that position, it would see only its own traffic, however busy the graphs looked.",
+    "see": [
+      "LAN",
+      "Interface"
+    ]
+  },
+  {
+    "term": "Promiscuous mode",
+    "short": "Asking the network card to hand over frames not addressed to this machine.",
+    "body": "Netwatch asks for this, which is how it sees other devices on the network. On a switched network it does not grant anything magical: it only sees what the switch sends this machine's way, which in a gateway position is everything.",
+    "see": [
+      "Capture",
+      "Gateway"
+    ]
+  },
+  {
+    "term": "Online and offline",
+    "short": "Whether this device has been seen recently.",
+    "body": "\"Online\" here means netwatch saw a frame from or to this device within the last five minutes. It is not a ping test and no device is ever asked anything. A device sleeping to save power reads as offline, which is usually correct and entirely harmless.",
+    "see": [
+      "Offline grace",
+      "Flapping"
+    ]
+  },
+  {
+    "term": "Offline grace",
+    "short": "How long a device must be silent before it is flagged and then reported.",
+    "body": "Five minutes of silence shows it as offline in the dashboard, because that is only a display. Fifteen minutes is when it becomes worth a message, since a phone asleep for ten minutes is not news. Reporting offline devices uses the same rule everywhere.",
+    "see": [
+      "Online and offline",
+      "Re-arm window"
+    ]
+  },
+  {
+    "term": "Flapping",
+    "short": "A device that keeps dropping off and coming back.",
+    "body": "Common with phones, which sleep their wireless to save battery, and with smart plugs. Before the current rules, one flapping device here produced over four hundred alerts. Netwatch now mentions a device once and then stays quiet about it for six hours, so the channel stays worth reading.",
+    "see": [
+      "Re-arm window",
+      "Online and offline"
+    ]
+  },
+  {
+    "term": "Re-arm window",
+    "short": "How long after an alert Netwatch refuses to repeat one about the same device.",
+    "body": "Six hours, for offline alerts. It is the difference between a useful alert and a channel nobody reads. New devices are not subject to it — a device nobody has seen before is always announced immediately.",
+    "see": [
+      "Flapping",
+      "Severity"
+    ]
+  },
+  {
+    "term": "Session",
+    "short": "One stretch of time during which a device was seen.",
+    "body": "A session opens when a device is first seen after being quiet and closes when it goes silent again. The history of sessions is what the detail page draws as a bar over time, which answers \"when is this thing actually on?\".",
+    "see": [
+      "Online and offline",
+      "Timeline"
+    ]
+  },
+  {
+    "term": "Trust level",
+    "short": "What you have decided about a device: unknown, known, trusted or ignored.",
+    "body": "Unknown means nobody has looked at it yet and it sits in the review queue. Known means you have recognised it. Trusted means you expect it. Ignored means Netwatch says nothing about it at all — the switch to use for a noisy gadget you do not care about.",
+    "see": [
+      "Review queue",
+      "Device kind"
+    ]
+  },
+  {
+    "term": "Review queue",
+    "short": "The devices nobody has said anything about yet.",
+    "body": "The point of the queue is that you look at the list and recognise — or fail to recognise — each device. \"I don't know what that one is\" is the most valuable thing this dashboard can produce, and it is exactly what a queue of reviewed and unreviewed devices is for.",
+    "see": [
+      "Trust level",
+      "Device name"
+    ]
+  },
+  {
+    "term": "Device name",
+    "short": "What you call a device, which outranks every guess.",
+    "body": "Names can come from three places, in this order: what you typed, a name the device announced over mDNS, and finally its maker. Only the first is a decision; the others are suggestions, shown as such.",
+    "see": [
+      "mDNS",
+      "Device kind"
+    ]
+  },
+  {
+    "term": "Device kind",
+    "short": "What sort of thing a device is — phone, laptop, camera and so on.",
+    "body": "Only you can set this. When Netwatch offers a kind it comes from the maker (a chip by Espressif is usually a smart-home gadget), and it is labelled a guess because that is what it is.",
+    "see": [
+      "Device name",
+      "OUI prefix"
+    ]
+  },
+  {
+    "term": "Severity",
+    "short": "How loud an alert is: info, notable or alert.",
+    "body": "Notable events are the ordinary things worth knowing — a device going quiet, a new address. Alerts are things that deserve a look now: a brand-new device, two devices using one address, capture stopping. Info is the quiet background, off by default in messages.",
+    "see": [
+      "Re-arm window",
+      "Alert"
+    ]
+  },
+  {
+    "term": "Alert",
+    "short": "A short factual statement about something Netwatch observed.",
+    "body": "Every alert is a fact from the wire, not a conclusion. \"A new hardware address was seen\" is a fact; \"someone has broken in\" is not, and Netwatch will not say it. Every alert carries the reasoning that produced it, so you can disagree with it.",
+    "see": [
+      "Severity",
+      "New device"
+    ]
+  },
+  {
+    "term": "MAC conflict",
+    "short": "Two different devices using the same IP address at the same time.",
+    "body": "Usually it is the router handing the same lease to two devices in quick succession, which is untidy rather than dangerous. It can also mean a device claiming an address that is not its own. Netwatch reports it as something to know, not something proven.",
+    "see": [
+      "ARP",
+      "DHCP"
+    ]
+  },
+  {
+    "term": "Baseline",
+    "short": "What a device's own traffic normally looks like.",
+    "body": "Netwatch keeps an hour of per-minute totals for every device and takes the middle value as normal. A device is only ever compared against itself, never against other devices, because a phone and a backup server are not the same kind of thing.",
+    "see": [
+      "Traffic spike"
+    ]
+  },
+  {
+    "term": "Traffic spike",
+    "short": "A device suddenly moving far more than its own usual amount.",
+    "body": "Flagged when one minute carries at least eight times the device's own typical minute, and at least a couple of megabytes. A backup, a game update or a film will do it. Reported at most once an hour per device, because a large download is not an incident.",
+    "see": [
+      "Baseline",
+      "Severity"
+    ]
+  },
+  {
+    "term": "Kernel drops",
+    "short": "Frames the operating system threw away because it was too busy.",
+    "body": "When traffic arrives faster than the program can read it, the kernel discards the excess. Nothing breaks — the totals stay right — but the picture has small holes. It usually means the machine is busy, not that anything is wrong.",
+    "see": [
+      "Capture",
+      "Packet"
+    ]
+  },
+  {
+    "term": "Sparkline",
+    "short": "The little bar chart showing the last hour or few minutes.",
+    "body": "A tiny graph next to a number, so a figure can be compared with its own recent past at a glance. Taller bars mean more traffic in that minute or sample.",
+    "see": [
+      "Baseline"
+    ]
+  },
+  {
+    "term": "Bytes and packets",
+    "short": "How much was sent, counted two ways.",
+    "body": "A packet count says how busy a conversation was; a byte count says how much it actually carried. A video call and a file download can send the same number of packets while moving wildly different amounts of data.",
+    "see": [
+      "Flow",
+      "Up and down"
+    ]
+  },
+  {
+    "term": "Up and down",
+    "short": "Bytes leaving a device versus arriving at it.",
+    "body": "Counted relative to the device, not to the internet: up is what it sent, down is what it received. When neither end of a conversation belongs to a device on your network, no direction is claimed, because guessing would be worse than staying quiet.",
+    "see": [
+      "Flow",
+      "Bytes and packets"
+    ]
+  },
+  {
+    "term": "Spool",
+    "short": "The file alerts are appended to, one per line.",
+    "body": "The daemon writes alerts to a file; a separate small program reads that file and sends them on. The split means a messaging outage can never slow down or stall the capture, and the alerts keep accumulating until delivery works again.",
+    "see": [
+      "Alert",
+      "Delivery"
+    ]
+  },
+  {
+    "term": "Delivery",
+    "short": "Sending spooled alerts to you, at least once each.",
+    "body": "The reader only marks an alert as sent after the destination has accepted it. If a message fails it is retried rather than dropped, which means a rare duplicate is possible. For security alerts, a duplicate is far better than a silence.",
+    "see": [
+      "Spool",
+      "Alert"
+    ]
+  },
+  {
+    "term": "Timeline",
+    "short": "The history of when a device was seen and when it was not.",
+    "body": "Built from sessions and kept across restarts, so you can answer whether a device is on all day or only at night. The last couple of dozen sessions are kept.",
+    "see": [
+      "Session"
+    ]
+  },
+  {
+    "term": "Uptime",
+    "short": "How long the monitor itself has been running.",
+    "body": "Not the network's uptime — netwatch's. Counters reset when it restarts; the device inventory does not, because that is remembered on disk.",
+    "see": [
+      "Capture"
+    ]
+  },
+  {
+    "term": "Loopback",
+    "short": "Traffic a machine sends to itself, on 127.0.0.1.",
+    "body": "Programs talking to other programs on the same machine. It never touches the network, so it is excluded from conversations and destinations.",
+    "see": [
+      "Interface"
+    ]
+  },
+  {
+    "term": "Tailscale",
+    "short": "The private network used to reach this dashboard from anywhere.",
+    "body": "The dashboard listens only on this machine, and Tailscale makes it reachable from your own devices without exposing it to the internet. That is why there is no password: nothing on the public internet can reach it.",
+    "see": [
+      "Interface"
+    ]
+  },
+  {
+    "term": "Scan noise",
+    "short": "The traffic an inventory tool generates by probing the network.",
+    "body": "Tools that ping every address or sweep every port announce themselves to the whole network and disturb devices to find them. Netwatch does none of that: it learns only from traffic that was already flowing, which is why its picture is built from what devices actually do rather than what they answer when asked.",
+    "see": [
+      "Capture",
+      "ARP"
+    ]
+  },
+  {
+    "term": "Budget",
+    "short": "A daily traffic limit you set for one device.",
+    "body": "Type a number of gigabytes against a device and Netwatch adds up that device's traffic from midnight UTC. Cross the line and you get one alert for the day — not one per gigabyte. The figure is the same one the device page shows, so the alert and the page can never disagree. Blank means no budget."
+  },
+  {
+    "term": "Retention",
+    "short": "How long Netwatch keeps what it has seen.",
+    "body": "The live view is held in memory and dies with the process. Once a minute Netwatch writes the day's totals — bytes each way, packets, seconds online, sessions — into a small database file, so uptime and volume are still there next month. The default is 365 days; older rows are deleted automatically. Ninety devices for a year is a few megabytes."
+  },
+  {
+    "term": "Quiet",
+    "short": "Keep telling the dashboard, stop telling your phone.",
+    "body": "Every device can be set to default (tell me everything), quiet (only things that need action, like two devices fighting over one address) or never (nothing at all). Nothing is thrown away either way: the dashboard and the alert log keep every fact, and each alert records whether it was sent. Quiet is not the same as ignored — an ignored device is left out of the counts entirely."
+  }
+]

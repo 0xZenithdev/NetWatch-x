@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="Netwatch — a read-only view of what is happening on this network.">
+<title>Netwatch — what is on my network</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◈</span>
+    <div class="brand-text">
+      <h1>Netwatch</h1>
+      <p class="sub" id="subtitle">connecting…</p>
+    </div>
+    <button class="ghost" id="helpBtn" title="Open the glossary — every term on this page is explained">?</button>
+  </div>
+  <div class="chips" id="chips"></div>
+</header>
+
+<nav class="tabs" id="tabs" role="tablist">
+  <button class="tab active" data-tab="overview" role="tab">Overview</button>
+  <button class="tab" data-tab="devices" role="tab">Devices</button>
+  <button class="tab" data-tab="traffic" role="tab">Traffic</button>
+  <button class="tab" data-tab="alerts" role="tab">Alerts</button>
+  <button class="tab" data-tab="glossary" role="tab">Glossary</button>
+</nav>
+
+<main>
+  <div id="banner" class="banners"></div>
+  <section id="panel-overview" class="panel"></section>
+  <section id="panel-devices" class="panel hidden"></section>
+  <section id="panel-traffic" class="panel hidden"></section>
+  <section id="panel-alerts" class="panel hidden"></section>
+  <section id="panel-glossary" class="panel hidden"></section>
+</main>
+
+<aside id="drawer" class="drawer hidden" aria-hidden="true" role="dialog" aria-modal="false"></aside>
+<div id="toast" class="toast hidden" role="status"></div>
+
+<footer>
+  netwatchd · read-only passive capture · 128-byte snapshot, no payloads stored ·
+  <button class="term" data-term="Scan noise">nothing is ever scanned</button>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

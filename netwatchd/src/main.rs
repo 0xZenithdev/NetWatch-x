@@ -5,11 +5,11 @@
 // here. Everything else, including the full pedantic set, still applies.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-//! netwatchd — headless network flow monitor with a browser dashboard.
+//! netwatchd — a headless network flow monitor with a browser dashboard.
 //!
-//! Captures packets with libpcap, aggregates them into flows, and serves a small
-//! dashboard over HTTP. Everything is embedded in this binary: no external
-//! assets, no CDN, no API keys.
+//! Captures packets with libpcap, aggregates them into flows, learns which
+//! devices are on the network, and serves a dashboard over HTTP. Everything is
+//! embedded in this binary: no external assets, no CDN, no API keys, no LLM.
 //!
 //! Binds to 127.0.0.1 by default so `tailscale serve` can proxy to it without
 //! exposing it on the LAN.
@@ -17,17 +17,33 @@
 //! Capture needs `CAP_NET_RAW`. Composing packets is not required and is never
 //! done here — this is read-only monitoring.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+mod alerts;
+mod api;
+mod capture;
+mod devices;
+mod history;
+mod http;
+mod oui;
+mod state;
+mod store;
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use etherparse::{LinkSlice, NetSlice, SlicedPacket, TransportSlice};
+use state::State;
 
 const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8790;
-const SNAPLEN: i32 = 128; // headers only: we count, we do not collect payloads
+/// How often devices are retired, series sampled and the inventory considered.
+const SWEEP_SECS: u64 = 30;
+/// How often a changed inventory is written to disk. Every sweep would be a few
+/// hundred kilobytes every thirty seconds, which on a homelab disk is a lot of
+/// writes for state that changes slowly. An operator edit is saved immediately
+/// instead, because that one is a decision rather than an observation.
+const SAVE_SECS: u64 = 600;
 
 const USAGE: &str = "\
 netwatchd — headless network flow monitor
@@ -42,871 +58,29 @@ OPTIONS:
         --demo           serve the dashboard without capturing anything
         --list           list available interfaces and exit
         --alerts <PATH>  append alerts as JSON lines to PATH
-        --test-alert     append one test alert and exit, to prove delivery works
         --devices <PATH> remember devices across restarts, so a crash or an
                          upgrade does not re-announce every device as new
+                         (default: devices.json beside --alerts)
+        --history <PATH> keep the long-term record in a SQLite file: one row per
+                         device per day, plus sessions, so uptime and volume are
+                         still there next month (default: history.db beside
+                         --devices; pass an empty value to switch it off)
+        --history-days <N> how many days to keep (default: 365)
+        --no-dns-names   do not read domain names out of plaintext DNS; the
+                         device list then shows addresses only
+        --test-alert     append one test alert and exit, to prove delivery works
+    -V, --version        print the version and exit
     -h, --help           show this help
 
 NOTE:
     Capturing requires CAP_NET_RAW. Without it the dashboard still runs and will
-    tell you exactly what to do about it.";
+    tell you exactly what to do about it.
 
-//──────────────────────────────────────────────────────────────── state
-
-/// One end of a conversation. Ordered so the two ends can be put in a canonical
-/// order, which is what makes aggregation bidirectional: the reply updates the
-/// same entry as the request instead of inventing a second flow.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-struct Endpoint {
-    ip: IpAddr,
-    port: u16,
-}
-
-impl std::fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.ip, self.port)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct FlowKey {
-    proto: &'static str,
-    /// The lower of the two endpoints. Never the "source": a key that depended
-    /// on who spoke first would split every conversation in two.
-    a: Endpoint,
-    b: Endpoint,
-}
-
-#[derive(Default, Clone)]
-struct Flow {
-    ab_packets: u64,
-    ab_bytes: u64,
-    ba_packets: u64,
-    ba_bytes: u64,
-    first_seen: u64,
-    last_seen: u64,
-}
-
-impl Flow {
-    fn packets(&self) -> u64 {
-        self.ab_packets + self.ba_packets
-    }
-    fn bytes(&self) -> u64 {
-        self.ab_bytes + self.ba_bytes
-    }
-}
-
-struct State {
-    iface: String,
-    mode: &'static str,
-    started: Instant,
-    flows: HashMap<FlowKey, Flow>,
-    packets: u64,
-    bytes: u64,
-    kernel_dropped: u32,
-    kernel_received: u32,
-    error: Option<String>,
-    note: Option<String>,
-    /// Addresses of the interface being captured, used to tell "up" from "down".
-    local_ips: Vec<IpAddr>,
-    /// Most recent alerts, newest last.
-    alerts: Vec<Alert>,
-    /// Where alerts are appended, if anywhere.
-    alert_sink: Option<std::path::PathBuf>,
-    /// Hosts seen on the wire, keyed by MAC.
-    devices: HashMap<[u8; 6], Device>,
-}
-
-//──────────────────────────────────────────────────────────────── devices
-
-/// A host seen on the wire, identified by its MAC.
-#[derive(Clone)]
-struct Device {
-    mac: [u8; 6],
-    ips: Vec<IpAddr>,
-    first_seen: u64,
-    last_seen: u64,
-    packets: u64,
-    bytes: u64,
-    online: bool,
-}
-
-/// A device that keeps changing address would otherwise grow this list without
-/// limit; eight is far more than an honest host needs.
-const MAX_IPS_PER_DEVICE: usize = 8;
-/// How long a device may be silent before it is called offline.
-const DEVICE_IDLE_SECS: u64 = 300;
-
-fn mac_string(mac: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
-}
-
-/// Addresses that can belong to a host on this network: private IPv4,
-/// link-local, IPv6 unique-local and IPv6 link-local.
-///
-/// `172.67.219.2` and `172.217.112.4` are Cloudflare and Google, not private
-/// addresses — only 172.16.0.0/12 is — which is exactly the mistake live
-/// traffic caught here.
-fn is_lan_address(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            let head = v6.segments()[0];
-            head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
-        }
-    }
-}
-
-/// MACs that cannot belong to a host: broadcast, multicast, or all zero.
-fn is_host_mac(mac: [u8; 6]) -> bool {
-    mac != [0u8; 6] && mac[0] & 1 == 0
-}
-
-/// Record a sighting of a device, raising an alert the first time a MAC is seen.
-///
-/// A MAC that has never been seen before means a device joined the network;
-/// noticing that is the core of an intruder detector, and because this box is
-/// the gateway it gets the sighting for free, from traffic it was already
-/// handling. Nothing has to be scanned, so nothing is disturbed on the LAN.
-fn learn_device(s: &mut State, mac: [u8; 6], ip: IpAddr, len: u64, now: u64) {
-    if !is_host_mac(mac) {
-        return;
-    }
-    // A MAC may only be paired with an address on this LAN, in either direction.
-    // On traffic to or from the internet the peer MAC is the router, so pairing
-    // it with a remote address credits the router with every server the house
-    // talks to — which is what happened before this check existed.
-    if !is_lan_address(&ip) {
-        return;
-    }
-    // Our own addresses are not a device worth reporting.
-    if s.local_ips.contains(&ip) {
-        return;
-    }
-    if let Some(d) = s.devices.get_mut(&mac) {
-        d.last_seen = now;
-        d.packets += 1;
-        d.bytes += len;
-        d.online = true;
-        if !d.ips.contains(&ip) && d.ips.len() < MAX_IPS_PER_DEVICE {
-            d.ips.push(ip);
-        }
-        return;
-    }
-    s.devices.insert(
-        mac,
-        Device {
-            mac,
-            ips: vec![ip],
-            first_seen: now,
-            last_seen: now,
-            packets: 1,
-            bytes: len,
-            online: true,
-        },
-    );
-    emit_alert(
-        s,
-        "new_device",
-        "alert",
-        &mac_string(mac),
-        &format!("{ip} — first sighting on this network"),
-    );
-}
-
-/// Retire devices that have gone quiet. A device that stops transmitting is
-/// worth knowing about, and one that returns is worth knowing about too.
-fn sweep_devices(s: &mut State, now: u64) {
-    let mut went_offline = Vec::new();
-    for d in s.devices.values_mut() {
-        if d.online && now.saturating_sub(d.last_seen) > DEVICE_IDLE_SECS {
-            d.online = false;
-            went_offline.push(mac_string(d.mac));
-        }
-    }
-    for mac in went_offline {
-        emit_alert(
-            s,
-            "device_offline",
-            "notable",
-            &mac,
-            &format!("no traffic for over {DEVICE_IDLE_SECS}s"),
-        );
-    }
-}
-
-/// Keep the device inventory alive: load what was remembered, retire devices
-/// that have gone quiet, and write the inventory back so a restart does not
-/// re-announce every device on the network.
-fn spawn_device_keeper(state: Arc<Mutex<State>>, devices: Option<std::path::PathBuf>) {
-    if let Some(path) = &devices {
-        let known = match state.lock() {
-            Ok(mut s) => load_devices(path, &mut s),
-            Err(_) => 0,
-        };
-        println!("devices: {known} known from {}", path.display());
-    }
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(30));
-        let now = match state.lock() {
-            Ok(s) => s.started.elapsed().as_secs(),
-            Err(_) => return,
-        };
-        if let Ok(mut s) = state.lock() {
-            sweep_devices(&mut s, now);
-            if let Some(path) = &devices
-                && let Err(e) = save_devices(path, &s)
-            {
-                eprintln!("could not save devices: {e}");
-            }
-        }
-    });
-}
-
-/// Parse `aa:bb:cc:dd:ee:ff`.
-fn parse_mac(text: &str) -> Option<[u8; 6]> {
-    let parts: Vec<&str> = text.split(':').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16).ok()?;
-    }
-    Some(mac)
-}
-
-/// Write the inventory where a restart can find it, atomically so a crash
-/// mid-write cannot leave a half-file behind.
-fn save_devices(path: &std::path::Path, s: &State) -> std::io::Result<()> {
-    let rows: Vec<serde_json::Value> = s
-        .devices
-        .values()
-        .map(|d| {
-            serde_json::json!({
-                "mac": mac_string(d.mac),
-                "ips": d.ips.iter().map(ToString::to_string).collect::<Vec<String>>(),
-                "first_seen": d.first_seen,
-                "last_seen": d.last_seen,
-                "packets": d.packets,
-                "bytes": d.bytes,
-            })
-        })
-        .collect();
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&rows).unwrap_or_default())?;
-    std::fs::rename(&tmp, path)
-}
-
-/// Load a previously written inventory. Without this a restart re-announces
-/// every device on the network as new, which is an alert storm on any crash —
-/// exactly the moment an operator is least willing to be shouted at.
-///
-/// Loaded devices are treated as already known, so they are not announced
-/// again. They start offline and come online on their next frame.
-fn load_devices(path: &std::path::Path, s: &mut State) -> usize {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return 0;
-    };
-    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
-        return 0;
-    };
-    let mut loaded = 0;
-    for row in rows {
-        let Some(mac) = row.get("mac").and_then(|v| v.as_str()).and_then(parse_mac) else {
-            continue;
-        };
-        let ips: Vec<IpAddr> = row
-            .get("ips")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str())
-                    .filter_map(|x| x.parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let num = |key: &str| row.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
-        s.devices.insert(
-            mac,
-            Device {
-                mac,
-                ips,
-                first_seen: num("first_seen"),
-                last_seen: num("last_seen"),
-                packets: num("packets"),
-                bytes: num("bytes"),
-                online: false,
-            },
-        );
-        loaded += 1;
-    }
-    loaded
-}
-
-//──────────────────────────────────────────────────────────────── alerts
-
-/// An event worth telling a human about.
-///
-/// Alerts are held in memory for the API and appended to a spool file that a
-/// separate notifier delivers. Keeping delivery out of this process means the
-/// daemon needs no HTTP or TLS stack at all, and a Telegram outage can never
-/// stall packet capture.
-#[derive(Clone)]
-struct Alert {
-    ts: u64,
-    kind: &'static str,
-    severity: &'static str,
-    subject: String,
-    detail: String,
-}
-
-/// How many alerts stay in memory (and therefore in the API payload).
-const ALERT_MEMORY: usize = 200;
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-impl Alert {
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "ts": self.ts,
-            "kind": self.kind,
-            "severity": self.severity,
-            "subject": self.subject,
-            "detail": self.detail,
-        })
-    }
-}
-
-/// Append one alert as a single JSON line.
-///
-/// One line per alert is deliberate: a torn write can lose the alert being
-/// written but cannot corrupt the ones already spooled, and a tailing reader
-/// never has to parse a half-written record.
-fn append_alert(path: &std::path::Path, a: &Alert) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{}", a.to_json())
-}
-
-fn write_test_alert(path: &std::path::Path) -> std::io::Result<()> {
-    append_alert(
-        path,
-        &Alert {
-            ts: now_unix(),
-            kind: "test",
-            severity: "info",
-            subject: "netwatchd test alert".into(),
-            detail: "If you received this, the alert path works end to end.".into(),
-        },
-    )
-}
-
-/// Record an alert in memory and spool it. A failure to write the spool must
-/// never take down the caller: the alert is still in memory and in the API.
-fn emit_alert(s: &mut State, kind: &'static str, severity: &'static str, subject: &str, detail: &str) {
-    let a = Alert {
-        ts: now_unix(),
-        kind,
-        severity,
-        subject: subject.to_string(),
-        detail: detail.to_string(),
-    };
-    if let Some(path) = &s.alert_sink {
-        let _ = append_alert(path, &a);
-    }
-    s.alerts.push(a);
-    let len = s.alerts.len();
-    if len > ALERT_MEMORY {
-        s.alerts.drain(0..len - ALERT_MEMORY);
-    }
-}
-
-//──────────────────────────────────────────────────────────────── capture
-
-fn friendly(msg: &str) -> String {
-    let lower = msg.to_lowercase();
-    if lower.contains("permission") || lower.contains("not permitted") || lower.contains("operation not permitted") {
-        format!(
-            "{msg}\n\nThis is the CAP_NET_RAW check. Grant it to this binary once:\n  \
-             sudo setcap cap_net_raw,cap_net_admin=eip {}",
-            std::env::current_exe().map_or_else(
-                |_| "<path to netwatchd>".into(),
-                |p| p.display().to_string(),
-            )
-        )
-    } else {
-        msg.to_string()
-    }
-}
-
-fn capture_loop(iface: &str, state: &Arc<Mutex<State>>) {
-    let opened = pcap::Capture::from_device(iface)
-        .and_then(|c| c.promisc(true).snaplen(SNAPLEN).timeout(250).open());
-    // setnonblock() consumes and returns the handle, so it has to be rebound
-    let mut cap = match opened.and_then(pcap::Capture::setnonblock) {
-        Ok(c) => c,
-        Err(e) => return set_error(state, &friendly(&e.to_string())),
-    };
-
-    let mut last_stats = Instant::now();
-    loop {
-        match cap.next_packet() {
-            Ok(packet) => ingest(packet.data, state),
-            Err(pcap::Error::NoMorePackets) => std::thread::sleep(Duration::from_millis(40)),
-            // BOTH empty-poll outcomes need a sleep. In NON-BLOCKING mode libpcap reports an empty
-            // buffer as TimeoutExpired (0) -- NoMorePackets (-2) is what a savefile returns, so on a
-            // live non-blocking capture this arm is the one that gets hit, and an empty arm spins the
-            // thread flat out. Measured 6 Oct 2026: 8d22h of CPU time on one thread while the
-            // interface carried 81 packets/second, i.e. a full core burnt on an idle LAN. A 5 ms
-            // pause costs ~1% of a core and still drains 81 pps with no backlog.
-            Err(pcap::Error::TimeoutExpired) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return set_error(state, &friendly(&e.to_string())),
-        }
-        if last_stats.elapsed() >= Duration::from_secs(2) {
-            // let-chain: both conditions have to hold before either value is used
-            if let Ok(st) = cap.stats()
-                && let Ok(mut s) = state.lock()
-            {
-                s.kernel_dropped = st.dropped;
-                s.kernel_received = st.received;
-            }
-            last_stats = Instant::now();
-        }
-    }
-}
-
-fn set_error(state: &Arc<Mutex<State>>, msg: &str) {
-    if let Ok(mut s) = state.lock() {
-        s.error = Some(msg.to_string());
-        // A monitor that has silently stopped monitoring is the worst failure
-        // mode there is, so losing capture raises an alert and not just a note
-        // on a dashboard nobody is looking at.
-        emit_alert(&mut s, "capture_failed", "alert", "capture stopped", msg);
-    }
-}
-
-fn ingest(data: &[u8], state: &Arc<Mutex<State>>) {
-    let Ok(pkt) = SlicedPacket::from_ethernet(data) else {
-        return;
-    };
-    let (src, dst) = match &pkt.net {
-        Some(NetSlice::Ipv4(ip)) => (
-            IpAddr::V4(Ipv4Addr::from(ip.header().source())),
-            IpAddr::V4(Ipv4Addr::from(ip.header().destination())),
-        ),
-        Some(NetSlice::Ipv6(ip)) => (
-            IpAddr::V6(Ipv6Addr::from(ip.header().source())),
-            IpAddr::V6(Ipv6Addr::from(ip.header().destination())),
-        ),
-        _ => return,
-    };
-    let (proto, sport, dport) = match &pkt.transport {
-        Some(TransportSlice::Tcp(t)) => ("TCP", t.source_port(), t.destination_port()),
-        Some(TransportSlice::Udp(u)) => ("UDP", u.source_port(), u.destination_port()),
-        _ => ("other", 0, 0),
-    };
-
-    // The Ethernet header identifies which host sent this; that is the whole
-    // basis of device discovery here.
-    let macs = match &pkt.link {
-        Some(LinkSlice::Ethernet2(eth)) => Some((eth.source(), eth.destination())),
-        _ => None,
-    };
-
-    let len = data.len() as u64;
-    let Ok(mut s) = state.lock() else { return };
-    let now = s.started.elapsed().as_secs();
-    if let Some((src_mac, dst_mac)) = macs {
-        // Both ends are real hosts on this LAN: the sender, and the receiver
-        // (which is how a download-heavy device is noticed at all).
-        learn_device(&mut s, src_mac, src, len, now);
-        learn_device(&mut s, dst_mac, dst, len, now);
-    }
-    observe(
-        &mut s,
-        proto,
-        Endpoint { ip: src, port: sport },
-        Endpoint { ip: dst, port: dport },
-        len,
-        now,
-    );
-}
-
-/// Fold one packet into the conversation it belongs to.
-///
-/// The endpoints are ordered before they become the key, so a request and its
-/// reply share an entry and the direction is recorded in the counters rather
-/// than by creating a second row. Pure state manipulation, no privileges
-/// needed — which is exactly why it is separable from the capture loop.
-fn observe(s: &mut State, proto: &'static str, src: Endpoint, dst: Endpoint, len: u64, now: u64) {
-    let forward = (src.ip, src.port) <= (dst.ip, dst.port);
-    let (a, b) = if forward { (src, dst) } else { (dst, src) };
-    let entry = s.flows.entry(FlowKey { proto, a, b }).or_insert_with(|| Flow {
-        first_seen: now,
-        last_seen: now,
-        ..Default::default()
-    });
-    if forward {
-        entry.ab_packets += 1;
-        entry.ab_bytes += len;
-    } else {
-        entry.ba_packets += 1;
-        entry.ba_bytes += len;
-    }
-    entry.last_seen = now;
-    s.packets += 1;
-    s.bytes += len;
-}
-
-/// Which end of a conversation is this host, who is the peer, and how much went
-/// each way. `None` for the local end means neither endpoint is ours — traffic
-/// routed through rather than to us — in which case no up/down can be claimed.
-fn orient(local_ips: &[IpAddr], k: &FlowKey, f: &Flow) -> (Option<Endpoint>, Endpoint, u64, u64) {
-    let is_local = |e: &Endpoint| local_ips.contains(&e.ip);
-    if is_local(&k.a) {
-        (Some(k.a), k.b, f.ab_bytes, f.ba_bytes)
-    } else if is_local(&k.b) {
-        (Some(k.b), k.a, f.ba_bytes, f.ab_bytes)
-    } else {
-        (None, k.b, 0, 0)
-    }
-}
-
-/// Fabricate conversations so the dashboard can be inspected without granting
-/// any capability. Addresses are RFC 5737 documentation ranges, so nothing about
-/// this machine's real network ends up in a public repository, and `mode` is
-/// reported as "demo" so synthetic traffic can never be mistaken for capture.
-fn demo_traffic(state: &Arc<Mutex<State>>) {
-    const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
-    let peers = [
-        (Ipv4Addr::new(192, 0, 2, 1), 443u16),
-        (Ipv4Addr::new(198, 51, 100, 7), 443),
-        (Ipv4Addr::new(203, 0, 113, 53), 53),
-        (Ipv4Addr::new(198, 51, 100, 20), 80),
-        (Ipv4Addr::new(203, 0, 113, 9), 853),
-    ];
-    // Plausible LAN hosts, so the device list and new-device alerts are
-    // exercised in demo mode too — demo traffic never reaches the packet
-    // parser, which is where real learning happens.
-    let lan: [([u8; 6], Ipv4Addr); 3] = [
-        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x01], Ipv4Addr::new(192, 0, 2, 20)),
-        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x02], Ipv4Addr::new(192, 0, 2, 21)),
-        ([0x02, 0x11, 0x22, 0x33, 0x44, 0x03], Ipv4Addr::new(192, 0, 2, 22)),
-    ];
-    let mut n: usize = 0;
-    loop {
-        std::thread::sleep(Duration::from_millis(350));
-        let (peer_ip, peer_port) = peers[n % peers.len()];
-        // try_from rather than `as`: the values are bounded by the modulus, and
-        // this says so instead of truncating on a target with 32-bit pointers
-        let offset = u16::try_from(n % 900).unwrap_or(0);
-        let extra = u64::try_from(n % 9000).unwrap_or(0);
-        let ours = Endpoint { ip: IpAddr::V4(LOCAL), port: 40000 + offset };
-        let peer = Endpoint { ip: IpAddr::V4(peer_ip), port: peer_port };
-        let now = match state.lock() {
-            Ok(s) => s.started.elapsed().as_secs(),
-            Err(_) => return,
-        };
-        if let Ok(mut s) = state.lock() {
-            observe(&mut s, "TCP", ours, peer, 128, now);
-            observe(&mut s, "TCP", peer, ours, 1400 + extra, now);
-            let (mac, lan_ip) = lan[(n / 4) % lan.len()];
-            learn_device(&mut s, mac, IpAddr::V4(lan_ip), 200 + extra, now);
-        }
-        n += 1;
-    }
-}
-
-fn device_addresses(name: &str) -> Vec<IpAddr> {
-    pcap::Device::list()
-        .ok()
-        .and_then(|ds| ds.into_iter().find(|d| d.name == name))
-        .map(|d| d.addresses.into_iter().map(|a| a.addr).collect())
-        .unwrap_or_default()
-}
-
-fn pick_device(wanted: Option<&str>) -> Result<String, String> {
-    let devices = pcap::Device::list().map_err(|e| format!("cannot list interfaces: {e}"))?;
-    if devices.is_empty() {
-        return Err("no capture interfaces found".into());
-    }
-    if let Some(name) = wanted {
-        return devices
-            .iter()
-            .find(|d| d.name == name)
-            .map(|d| d.name.clone())
-            .ok_or_else(|| format!("no interface named '{name}' (try --list)"));
-    }
-    devices
-        .iter()
-        .find(|d| d.addresses.iter().any(|a| !a.addr.is_loopback()))
-        .or_else(|| devices.first())
-        .map(|d| d.name.clone())
-        .ok_or_else(|| "no usable interface found".into())
-}
-
-fn list_ifaces() {
-    match pcap::Device::list() {
-        Ok(devices) => {
-            println!("capture interfaces:");
-            for d in devices {
-                let addrs: Vec<String> = d
-                    .addresses
-                    .iter()
-                    .map(|a| a.addr.to_string())
-                    .collect();
-                println!(
-                    "  {:<16} {}",
-                    d.name,
-                    if addrs.is_empty() { "-".to_string() } else { addrs.join(", ") }
-                );
-                if let Some(desc) = d.desc
-                    && !desc.trim().is_empty()
-                {
-                    println!("  {:<16}   {}", "", desc.trim());
-                }
-            }
-        }
-        Err(e) => eprintln!("cannot list interfaces: {e}"),
-    }
-}
-
-//──────────────────────────────────────────────────────────────── api
-
-fn stats_json(state: &Arc<Mutex<State>>) -> String {
-    let Ok(s) = state.lock() else {
-        return "{\"error\":\"state poisoned\"}".into();
-    };
-    let mut flows: Vec<(&FlowKey, &Flow)> = s.flows.iter().collect();
-    flows.sort_by_key(|a| std::cmp::Reverse(a.1.bytes()));
-
-    let top_flows: Vec<serde_json::Value> = flows
-        .iter()
-        .take(60)
-        .map(|(k, f)| {
-            let (local, peer, up, down) = orient(&s.local_ips, k, f);
-            serde_json::json!({
-                "proto": k.proto,
-                "a": k.a.to_string(),
-                "b": k.b.to_string(),
-                "local": local.map(|e| e.to_string()),
-                "peer": peer.to_string(),
-                "up_bytes": up, "down_bytes": down,
-                "packets": f.packets(), "bytes": f.bytes(),
-                "first_seen": f.first_seen, "last_seen": f.last_seen,
-            })
-        })
-        .collect();
-
-    let mut by_proto: HashMap<&str, u64> = HashMap::new();
-    let mut by_host: HashMap<String, u64> = HashMap::new();
-    for (k, f) in &flows {
-        *by_proto.entry(k.proto).or_insert(0) += f.bytes();
-        // Attribute volume to the far end only when we can tell which end that is.
-        let remote = match orient(&s.local_ips, k, f).0 {
-            Some(_) => orient(&s.local_ips, k, f).1.ip,
-            None => continue,
-        };
-        if !remote.is_loopback() && !remote.is_unspecified() {
-            *by_host.entry(remote.to_string()).or_insert(0) += f.bytes();
-        }
-    }
-    let mut hosts: Vec<(String, u64)> = by_host.into_iter().collect();
-    hosts.sort_by_key(|a| std::cmp::Reverse(a.1));
-    let top_hosts: Vec<serde_json::Value> = hosts
-        .into_iter()
-        .take(12)
-        .map(|(host, bytes)| serde_json::json!({ "host": host, "bytes": bytes }))
-        .collect();
-
-    let alerts: Vec<serde_json::Value> = s.alerts.iter().rev().take(50).map(Alert::to_json).collect();
-
-    let mut devices: Vec<&Device> = s.devices.values().collect();
-    devices.sort_by_key(|d| std::cmp::Reverse(d.last_seen));
-    let devices: Vec<serde_json::Value> = devices
-        .iter()
-        .take(200)
-        .map(|d| {
-            serde_json::json!({
-                "mac": mac_string(d.mac),
-                "ips": d.ips.iter().map(ToString::to_string).collect::<Vec<String>>(),
-                "first_seen": d.first_seen,
-                "last_seen": d.last_seen,
-                "packets": d.packets,
-                "bytes": d.bytes,
-                "online": d.online,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "alerts": alerts,
-        "alert_count": s.alerts.len(),
-        "devices": devices,
-        "device_count": s.devices.len(),
-        "iface": s.iface,
-        "mode": s.mode,
-        "uptime_s": s.started.elapsed().as_secs(),
-        "packets": s.packets,
-        "bytes": s.bytes,
-        "flows": s.flows.len(),
-        "kernel_received": s.kernel_received,
-        "kernel_dropped": s.kernel_dropped,
-        "error": s.error,
-        "note": s.note,
-        "by_proto": by_proto,
-        "top_hosts": top_hosts,
-        "top_flows": top_flows,
-    })
-    .to_string()
-}
-
-//──────────────────────────────────────────────────────────────── http
-
-fn http_loop(listener: &TcpListener, state: &Arc<Mutex<State>>) {
-    // a failed accept is not fatal: skip it and keep serving
-    for s in listener.incoming().flatten() {
-        // each connection gets its own handle on the shared state
-        let st = state.clone();
-        std::thread::spawn(move || handle(s, &st));
-    }
-}
-
-fn handle(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
-    let Ok(peek) = stream.try_clone() else { return };
-    let mut reader = BufReader::new(peek);
-    let mut request = String::new();
-    if reader.read_line(&mut request).is_err() {
-        return;
-    }
-    let path = request
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .split('?')
-        .next()
-        .unwrap_or("/")
-        .to_string();
-    // drain headers
-    loop {
-        let mut h = String::new();
-        match reader.read_line(&mut h) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if h == "\r\n" || h == "\n" => break,
-            Ok(_) => {}
-        }
-    }
-
-    let (code, ctype, body) = match path.as_str() {
-        "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", DASHBOARD.to_string()),
-        "/api/stats" => ("200 OK", "application/json", stats_json(state)),
-        "/healthz" => ("200 OK", "text/plain", "ok".to_string()),
-        "/favicon.ico" => ("204 No Content", "text/plain", String::new()),
-        _ => ("404 Not Found", "text/plain", "not found".to_string()),
-    };
-    let response = format!(
-        "HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-}
-
-//──────────────────────────────────────────────────────────────── ui
-
-const DASHBOARD: &str = r#"<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>netwatch</title>
-<style>
-  :root{--bg:#0d1117;--panel:#161b22;--line:#243040;--fg:#e6edf3;--dim:#8b949e;--acc:#58a6ff;--warn:#d29922;--bad:#f85149}
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-  header{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px;align-items:baseline}
-  h1{font-size:16px;margin:0;letter-spacing:.3px}
-  .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
-  main{padding:14px 16px 40px;max-width:1000px;margin:0 auto}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-  .card .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
-  .card .v{font-size:20px;font-variant-numeric:tabular-nums;margin-top:2px}
-  h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px;margin:22px 0 8px}
-  .row{display:flex;justify-content:space-between;gap:10px;padding:7px 2px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
-  .row:last-child{border-bottom:0}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;word-break:break-all}
-  .num{color:var(--dim);white-space:nowrap}
-  .banner{border-radius:10px;padding:10px 12px;margin:14px 0;border:1px solid;white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;font-size:12px}
-  .banner.err{background:#2d1418;border-color:#5c1f26;color:#ffb3ae}
-  .banner.note{background:#2a2310;border-color:#5c4a12;color:#f0d38a}
-  .muted{color:var(--dim)}
-  footer{color:var(--dim);font-size:11px;padding:10px 16px 30px;text-align:center}
-</style></head>
-<body>
-<header>
-  <h1>netwatch</h1>
-  <span class="tag" id="iface">…</span>
-  <span class="tag" id="mode">…</span>
-  <span class="tag" id="uptime">…</span>
-</header>
-<main>
-  <div id="banners"></div>
-  <div class="cards">
-    <div class="card"><div class="k">packets</div><div class="v" id="pkts">0</div></div>
-    <div class="card"><div class="k">volume</div><div class="v" id="bytes">0</div></div>
-    <div class="card"><div class="k">flows</div><div class="v" id="flows">0</div></div>
-    <div class="card"><div class="k">dropped</div><div class="v" id="dropped">0</div></div>
-  </div>
-  <h2>protocols</h2><div id="protos" class="muted">waiting for traffic…</div>
-  <h2>top destinations</h2><div id="hosts" class="muted">waiting for traffic…</div>
-  <h2>top flows</h2><div id="flowsbox" class="muted">waiting for traffic…</div>
-</main>
-<footer>netwatchd · read-only capture · no payloads stored</footer>
-<script>
-function hb(n){const u=["B","KB","MB","GB","TB"];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i?n.toFixed(1):n)+" "+u[i]}
-function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+"d "+h+"h":h?h+"h "+m+"m":m?m+"m":"just started"}
-function esc(x){return String(x).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
-async function tick(){
-  let d;
-  try{ d = await (await fetch("/api/stats",{cache:"no-store"})).json() }catch(e){ return }
-  iface.textContent = "iface " + d.iface;
-  mode.textContent = d.mode;
-  uptime.textContent = dur(d.uptime_s||0);
-  pkts.textContent = (d.packets||0).toLocaleString();
-  bytes.textContent = hb(d.bytes||0);
-  flows.textContent = (d.flows||0).toLocaleString();
-  dropped.textContent = (d.kernel_dropped||0).toLocaleString();
-  let b = "";
-  if(d.error) b += '<div class="banner err">'+esc(d.error)+'</div>';
-  if(d.mode==="demo") b += '<div class="banner note">demo mode — the traffic below is synthetic and nothing is being captured. Start without --demo, with CAP_NET_RAW, for real data.</div>';
-  banners.innerHTML = b;
-  const p = d.by_proto||{};
-  const total = Object.values(p).reduce((a,c)=>a+c,0)||1;
-  const pk = Object.entries(p).sort((a,b)=>b[1]-a[1]);
-  protos.innerHTML = pk.length? pk.map(([k,v])=>'<div class="row"><span>'+esc(k)+'</span><span class="num">'+hb(v)+' · '+Math.round(v/total*100)+'%</span></div>').join("") : '<span class="muted">waiting for traffic…</span>';
-  const hs = d.top_hosts||[];
-  hosts.innerHTML = hs.length? hs.map(h=>'<div class="row"><span class="mono">'+esc(h.host)+'</span><span class="num">'+hb(h.bytes)+'</span></div>').join("") : '<span class="muted">waiting for traffic…</span>';
-  const fs = (d.top_flows||[]).slice(0,40);
-  flowsbox.innerHTML = fs.length? fs.map(f=>{
-    const who = f.local ? '<span class="muted">↔</span> '+esc(f.peer) : esc(f.a)+' <span class="muted">↔</span> '+esc(f.b);
-    const dir = f.local ? '<span class="muted">↑</span>'+hb(f.up_bytes)+' <span class="muted">↓</span>'+hb(f.down_bytes) : f.packets+' pkts';
-    return '<div class="row"><span class="mono">'+esc(f.proto)+' '+who+'</span><span class="num">'+hb(f.bytes)+' '+dir+'</span></div>';
-  }).join("") : '<span class="muted">waiting for traffic…</span>';
-}
-tick(); setInterval(tick, 2000);
-</script>
-</body></html>
-"#;
-
-//──────────────────────────────────────────────────────────────── main
+PRIVACY:
+    The capture snapshot is 128 bytes, so payloads are not retained. The single
+    exception is that the *name* in a plaintext DNS query is read, because it is
+    the only way to say what a device is doing; nothing else is looked at, and
+    --no-dns-names turns even that off.";
 
 /// Everything the command line can configure.
 #[derive(Default)]
@@ -917,17 +91,23 @@ struct Config {
     demo: bool,
     alerts: Option<std::path::PathBuf>,
     devices: Option<std::path::PathBuf>,
+    history: Option<std::path::PathBuf>,
+    history_days: Option<u64>,
+    dns_names: bool,
     test_alert: bool,
 }
 
 /// Parse arguments.
 ///
-/// `Ok(None)` means the requested work is already done — `--help` and `--list`
-/// print and return — and an unknown flag is an error rather than something to
-/// ignore, because a typo silently running the daemon unconfigured is worse
-/// than refusing to start.
+/// `Ok(None)` means the requested work is already done — `--help`, `--list` and
+/// `--version` print and return — and an unknown flag is an error rather than
+/// something to ignore, because a typo silently running the daemon unconfigured
+/// is worse than refusing to start.
 fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
-    let mut c = Config::default();
+    let mut c = Config {
+        dns_names: true,
+        ..Config::default()
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -955,12 +135,34 @@ fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
                 c.devices = args.get(i + 1).map(std::path::PathBuf::from);
                 i += 2;
             }
+            "--history" => {
+                // An empty value switches retention off, which is a real choice
+                // on a box with a small disk.
+                c.history = match args.get(i + 1).map(String::as_str) {
+                    Some("") => None,
+                    Some(path) => Some(std::path::PathBuf::from(path)),
+                    None => Some(std::path::PathBuf::from("history.db")),
+                };
+                i += 2;
+            }
+            "--history-days" => {
+                c.history_days = args.get(i + 1).and_then(|v| v.parse().ok());
+                i += 2;
+            }
+            "--no-dns-names" => {
+                c.dns_names = false;
+                i += 1;
+            }
             "--test-alert" => {
                 c.test_alert = true;
                 i += 1;
             }
             "--list" => {
-                list_ifaces();
+                capture::list_ifaces();
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("netwatchd {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-h" | "--help" => {
@@ -974,78 +176,93 @@ fn parse_args(args: &[String]) -> Result<Option<Config>, String> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cfg = match parse_args(&args) {
-        Ok(Some(c)) => c,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("{e}\n\n{USAGE}");
-            std::process::exit(2);
-        }
+    let Some(cfg) = config_or_exit() else {
+        return;
     };
-    let Config { iface, bind, port, demo, alerts, devices, test_alert } = cfg;
-    let bind = bind.unwrap_or_else(|| DEFAULT_BIND.to_string());
-    let port = port.unwrap_or(DEFAULT_PORT);
+    let bind = cfg.bind.clone().unwrap_or_else(|| DEFAULT_BIND.to_string());
+    let port = cfg.port.unwrap_or(DEFAULT_PORT);
+    let chosen = pick_interface(&cfg);
 
-    let chosen = if demo {
-        iface.unwrap_or_else(|| "demo".to_string())
-    } else {
-        match pick_device(iface.as_deref()) {
-            Ok(name) => name,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    if test_alert {
-        let path = alerts.unwrap_or_else(|| std::path::PathBuf::from("alerts.jsonl"));
-        match write_test_alert(&path) {
-            Ok(()) => {
-                println!("wrote one test alert to {}", path.display());
-                return;
-            }
+    if cfg.test_alert {
+        let path = cfg
+            .alerts
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("alerts.jsonl"));
+        match alerts::write_test_alert(&path) {
+            Ok(()) => println!("wrote one test alert to {}", path.display()),
             Err(e) => {
                 eprintln!("cannot write {}: {e}", path.display());
                 std::process::exit(1);
             }
         }
+        return;
     }
 
-    let local_ips = if demo {
-        vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+    let local_ips = if cfg.demo {
+        vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 10, 200))]
     } else {
-        device_addresses(&chosen)
+        capture::device_addresses(&chosen)
     };
-    let state = Arc::new(Mutex::new(State {
-        iface: chosen.clone(),
-        mode: if demo { "demo" } else { "live" },
-        started: Instant::now(),
-        flows: HashMap::new(),
-        packets: 0,
-        bytes: 0,
-        kernel_dropped: 0,
-        kernel_received: 0,
-        error: None,
-        note: None,
-        local_ips,
-        alerts: Vec::new(),
-        alert_sink: alerts,
-        devices: HashMap::new(),
-    }));
+    // The device store defaults to sitting beside the alert spool: a deployment
+    // that asked for alerts has a state directory, and losing the inventory on
+    // every restart is the bug this prevents.
+    let device_store = cfg.devices.clone().or_else(|| {
+        cfg.alerts
+            .as_ref()
+            .map(|p| p.with_file_name("devices.json"))
+    });
+    // Retention sits beside the inventory unless told otherwise.
+    let history_path = cfg.history.clone().or_else(|| {
+        device_store
+            .as_ref()
+            .map(|p| p.with_file_name("history.db"))
+    });
+    let history = match &history_path {
+        Some(path) => match history::History::open(
+            path,
+            cfg.history_days.unwrap_or(history::DEFAULT_KEEP_DAYS),
+        ) {
+            Ok(h) => Some(Arc::new(Mutex::new(h))),
+            Err(e) => {
+                // Retention is a nice-to-have; capture is the job. Say so and
+                // carry on rather than refusing to start.
+                eprintln!("history: {e} — continuing without long-term records");
+                None
+            }
+        },
+        None => None,
+    };
 
-    if demo {
-        println!("netwatchd in demo mode: synthetic traffic, nothing is captured");
-        let st = state.clone();
-        std::thread::spawn(move || demo_traffic(&st));
-    } else {
-        let st = state.clone();
-        let name = chosen.clone();
-        std::thread::spawn(move || capture_loop(&name, &st));
+    let state = Arc::new(Mutex::new(initial_state(
+        &cfg,
+        &chosen,
+        local_ips,
+        device_store.clone(),
+        history.clone(),
+        history_path.clone(),
+    )));
+    announce_inventory(&state, device_store.as_ref());
+    if let (Some(hist), Some(path)) = (&history, &history_path)
+        && let (Ok(mut s), Ok(h)) = (state.lock(), hist.lock())
+    {
+        let restored = history::restore_today(&h, &mut s, state::now_unix()).unwrap_or(0);
+        println!(
+            "history: keeping {} days in {} ({restored} devices continue today's totals)",
+            h.keep_days(),
+            path.display()
+        );
     }
 
-    spawn_device_keeper(Arc::clone(&state), devices);
+    if cfg.demo {
+        println!("netwatchd in demo mode: synthetic traffic, nothing is captured");
+        let st = Arc::clone(&state);
+        std::thread::spawn(move || capture::demo_traffic(&st));
+    } else {
+        let st = Arc::clone(&state);
+        let name = chosen.clone();
+        std::thread::spawn(move || capture::capture_loop(&name, &st));
+    }
+    spawn_keeper(Arc::clone(&state), history);
 
     let addr = format!("{bind}:{port}");
     let listener = match TcpListener::bind(&addr) {
@@ -1055,23 +272,190 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("netwatchd listening on http://{addr}  (interface: {chosen})");
-    http_loop(&listener, &state);
+    println!(
+        "netwatchd listening on http://{addr}  (interface: {chosen}, mode: {})",
+        capture::mode_of(cfg.demo).as_str()
+    );
+    http::http_loop(&listener, &state);
+}
+
+/// Read the command line. `None` means help was asked for and printed; a bad
+/// argument prints the usage and exits, because a daemon that starts with half
+/// an argument set is worse than one that refuses to start.
+fn config_or_exit() -> Option<Config> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&args) {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("{e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Which interface to read, or the demo pseudo-interface.
+fn pick_interface(cfg: &Config) -> String {
+    if cfg.demo {
+        return cfg.iface.clone().unwrap_or_else(|| "demo".to_string());
+    }
+    match capture::pick_device(cfg.iface.as_deref()) {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The shared state, assembled before any thread is looking at it.
+fn initial_state(
+    cfg: &Config,
+    chosen: &str,
+    local_ips: Vec<IpAddr>,
+    device_store: Option<PathBuf>,
+    history: Option<Arc<Mutex<history::History>>>,
+    history_path: Option<PathBuf>,
+) -> State {
+    State {
+        iface: chosen.to_string(),
+        mode: capture::mode_of(cfg.demo),
+        started_at: state::now_unix(),
+        started: Instant::now(),
+        flows: HashMap::new(),
+        packets: 0,
+        bytes: 0,
+        kernel_dropped: 0,
+        kernel_received: 0,
+        error: None,
+        note: None,
+        local_ips,
+        alerts: VecDeque::new(),
+        alert_sink: cfg.alerts.clone(),
+        device_store,
+        history,
+        history_path,
+        devices: HashMap::new(),
+        ip_owners: HashMap::new(),
+        hostnames: HashMap::new(),
+        series: state::Series::default(),
+        dirty: false,
+        read_dns_names: cfg.dns_names,
+    }
+}
+
+/// Load the remembered inventory, and say plainly whether it is being kept — an
+/// operator who does not know their device names survived a restart will re-name
+/// everything "just to be safe".
+fn announce_inventory(state: &Arc<Mutex<State>>, device_store: Option<&PathBuf>) {
+    let Some(path) = device_store else {
+        println!("devices: no --devices path, so the inventory will be re-learned on restart");
+        return;
+    };
+    let known = match state.lock() {
+        Ok(mut s) => store::load_devices(path, &mut s),
+        Err(_) => 0,
+    };
+    println!("devices: {known} remembered from {}", path.display());
+}
+
+/// Retire silent devices, sample the throughput series, and persist the
+/// inventory now and then.
+///
+/// One thread does all three because they are all "every thirty seconds"
+/// work, and a monitor that spawns a thread per chore is a monitor nobody can
+/// reason about.
+fn spawn_keeper(state: Arc<Mutex<State>>, history: Option<Arc<Mutex<history::History>>>) {
+    std::thread::spawn(move || {
+        let mut last_save = state::now_unix();
+        // Session transitions, which only the keeper can see: it is the one
+        // place that knows how long ago the last sweep was.
+        let mut tracker = history::Tracker::default();
+        let mut last_tick = state::now_unix();
+        let mut failed_flushes: u32 = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(SWEEP_SECS));
+            let now = state::now_unix();
+            let elapsed = now.saturating_sub(last_tick);
+            last_tick = now;
+            let mut save_now = false;
+            if let Ok(mut s) = state.lock() {
+                devices::sweep_devices(&mut s, now);
+                let (packets, bytes) = (s.packets, s.bytes);
+                s.series.sample(packets, bytes, now);
+                s.trim_flows();
+                s.trim_hostnames();
+                if s.dirty && now.saturating_sub(last_save) >= SAVE_SECS {
+                    save_now = true;
+                }
+            }
+            // Retention: one lock, one transaction, per sweep. The work is
+            // proportional to the number of devices, never to the packets, and
+            // a device that moved nothing since the last flush is skipped.
+            if let Some(hist) = &history {
+                let (mut s, mut h) = (state.lock(), hist.lock());
+                if let (Ok(s), Ok(h)) = (&mut s, &mut h) {
+                    match history::flush(s, h, &mut tracker, now, elapsed) {
+                        Ok(_) => {
+                            failed_flushes = 0;
+                        }
+                        Err(e) => {
+                            // Loud once, then quiet: a full disk would otherwise
+                            // fill the journal with the same sentence.
+                            failed_flushes = failed_flushes.saturating_add(1);
+                            if failed_flushes == 1 || failed_flushes.is_multiple_of(20) {
+                                eprintln!("history: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            if save_now {
+                if let Ok(mut s) = state.lock() {
+                    match &s.device_store {
+                        Some(path) => match store::save_devices(path, &s) {
+                            Ok(()) => s.dirty = false,
+                            Err(e) => {
+                                // A failed save is reported and retried next
+                                // sweep; it must never stop the monitor.
+                                drop(s);
+                                eprintln!("could not save the device inventory: {e}");
+                                continue;
+                            }
+                        },
+                        None => s.dirty = false,
+                    }
+                }
+                last_save = now;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    // expect() is how a test states what it assumes; a broken assumption should
-    // panic and name itself. The workspace denies it in shipped code, where a
-    // panic is not an acceptable outcome.
-    #![allow(clippy::expect_used)]
+    // expect() and unwrap() are how a test states what it assumes; a broken
+    // assumption should panic and name itself. The workspace denies them in
+    // shipped code, where a panic is not an acceptable outcome.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::devices::{Kind, Trust};
+    use crate::state::{Endpoint, MAX_FLOWS};
+
+    /// Filename extension, compared without case because a download tool may
+    /// well have lowercased nothing at all.
+    fn has_extension(name: &str, want: &str) -> bool {
+        std::path::Path::new(name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(want))
+    }
 
     fn state(local: &[&str]) -> State {
         State {
             iface: "test0".into(),
-            mode: "live",
+            mode: state::Mode::Live,
+            started_at: state::now_unix(),
             started: Instant::now(),
             flows: HashMap::new(),
             packets: 0,
@@ -1081,21 +465,52 @@ mod tests {
             error: None,
             note: None,
             local_ips: local.iter().map(|s| s.parse().expect("test ip")).collect(),
-            alerts: Vec::new(),
+            alerts: VecDeque::new(),
             alert_sink: None,
+            device_store: None,
+            history: None,
+            history_path: None,
             devices: HashMap::new(),
+            ip_owners: HashMap::new(),
+            hostnames: HashMap::new(),
+            series: state::Series::default(),
+            dirty: false,
+            read_dns_names: true,
         }
     }
 
     fn ep(addr: &str, port: u16) -> Endpoint {
-        Endpoint { ip: addr.parse().expect("test ip"), port }
+        Endpoint {
+            ip: addr.parse().expect("test ip"),
+            port,
+        }
     }
+
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().expect("test ip")
+    }
+
+    fn mac6(last: u8) -> [u8; 6] {
+        [0x02, 0x00, 0x00, 0x00, 0x00, last]
+    }
+
+    /// A globally unique (not locally administered) address, so vendor lookups
+    /// behave the way they do for real hardware.
+    fn real_mac(last: u8) -> [u8; 6] {
+        [0x04, 0xea, 0x56, 0x00, 0x00, last]
+    }
+
+    fn alert_kinds(s: &State, kind: &str) -> usize {
+        s.alerts.iter().filter(|a| a.kind == kind).count()
+    }
+
+    //────────────────────────────────── flows
 
     #[test]
     fn a_reply_folds_into_the_same_conversation() {
         let mut s = state(&["10.0.0.5"]);
-        observe(&mut s, "TCP", ep("10.0.0.5", 52344), ep("1.1.1.1", 443), 100, 0);
-        observe(&mut s, "TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 52344), 900, 1);
+        s.observe("TCP", ep("10.0.0.5", 52344), ep("1.1.1.1", 443), 100, 0);
+        s.observe("TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 52344), 900, 1);
         assert_eq!(s.flows.len(), 1, "the reply must not open a second flow");
         let f = s.flows.values().next().expect("one flow");
         assert_eq!(f.packets(), 2);
@@ -1107,8 +522,8 @@ mod tests {
     fn direction_is_counted_not_duplicated() {
         let mut s = state(&["10.0.0.5"]);
         // 10.0.0.5:52344 sorts above 1.1.1.1:443, so the first packet is b->a
-        observe(&mut s, "TCP", ep("10.0.0.5", 52344), ep("1.1.1.1", 443), 100, 0);
-        observe(&mut s, "TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 52344), 900, 1);
+        s.observe("TCP", ep("10.0.0.5", 52344), ep("1.1.1.1", 443), 100, 0);
+        s.observe("TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 52344), 900, 1);
         let f = s.flows.values().next().expect("one flow");
         assert_eq!((f.ab_bytes, f.ba_bytes), (900, 100));
         assert_eq!((f.ab_packets, f.ba_packets), (1, 1));
@@ -1118,8 +533,8 @@ mod tests {
     fn flow_identity_does_not_depend_on_who_spoke_first() {
         let mut first = state(&[]);
         let mut second = state(&[]);
-        observe(&mut first, "UDP", ep("9.9.9.9", 53), ep("10.0.0.5", 33000), 60, 0);
-        observe(&mut second, "UDP", ep("10.0.0.5", 33000), ep("9.9.9.9", 53), 60, 0);
+        first.observe("UDP", ep("9.9.9.9", 53), ep("10.0.0.5", 33000), 60, 0);
+        second.observe("UDP", ep("10.0.0.5", 33000), ep("9.9.9.9", 53), 60, 0);
         assert_eq!(
             first.flows.keys().next().expect("a flow"),
             second.flows.keys().next().expect("a flow"),
@@ -1130,19 +545,34 @@ mod tests {
     #[test]
     fn protocols_do_not_share_a_conversation() {
         let mut s = state(&[]);
-        observe(&mut s, "TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 1), 10, 0);
-        observe(&mut s, "UDP", ep("1.1.1.1", 443), ep("10.0.0.5", 1), 10, 0);
+        s.observe("TCP", ep("1.1.1.1", 443), ep("10.0.0.5", 1), 10, 0);
+        s.observe("UDP", ep("1.1.1.1", 443), ep("10.0.0.5", 1), 10, 0);
         assert_eq!(s.flows.len(), 2);
     }
 
     #[test]
     fn up_is_whatever_leaves_this_host() {
         let mut s = state(&["192.168.10.200"]);
-        observe(&mut s, "TCP", ep("192.168.10.200", 51000), ep("93.184.216.34", 443), 500, 0);
-        observe(&mut s, "TCP", ep("93.184.216.34", 443), ep("192.168.10.200", 51000), 1500, 1);
+        s.observe(
+            "TCP",
+            ep("192.168.10.200", 51000),
+            ep("93.184.216.34", 443),
+            500,
+            0,
+        );
+        s.observe(
+            "TCP",
+            ep("93.184.216.34", 443),
+            ep("192.168.10.200", 51000),
+            1500,
+            1,
+        );
         let (k, f) = s.flows.iter().next().expect("one flow");
-        let (local, peer, up, down) = orient(&s.local_ips, k, f);
-        assert_eq!(local.expect("local end").to_string(), "192.168.10.200:51000");
+        let (local, peer, up, down) = s.orient(k, f);
+        assert_eq!(
+            local.expect("local end").to_string(),
+            "192.168.10.200:51000"
+        );
         assert_eq!(peer.to_string(), "93.184.216.34:443");
         assert_eq!((up, down), (500, 1500), "up is egress");
         assert_eq!(f.bytes(), 2000);
@@ -1151,9 +581,9 @@ mod tests {
     #[test]
     fn traffic_that_is_not_ours_claims_no_direction() {
         let mut s = state(&["10.0.0.5"]);
-        observe(&mut s, "TCP", ep("1.1.1.1", 1), ep("8.8.8.8", 2), 10, 0);
+        s.observe("TCP", ep("1.1.1.1", 1), ep("8.8.8.8", 2), 10, 0);
         let (k, f) = s.flows.iter().next().expect("one flow");
-        let (local, _, up, down) = orient(&s.local_ips, k, f);
+        let (local, _, up, down) = s.orient(k, f);
         assert!(local.is_none(), "neither end is us, so neither is local");
         assert_eq!((up, down), (0, 0), "no up/down may be invented");
     }
@@ -1162,7 +592,7 @@ mod tests {
     fn counters_accumulate_across_packets() {
         let mut s = state(&["10.0.0.5"]);
         for i in 0..10 {
-            observe(&mut s, "TCP", ep("10.0.0.5", 40000), ep("1.1.1.1", 80), 100, i);
+            s.observe("TCP", ep("10.0.0.5", 40000), ep("1.1.1.1", 80), 100, i);
         }
         let f = s.flows.values().next().expect("one flow");
         assert_eq!(f.packets(), 10);
@@ -1171,13 +601,32 @@ mod tests {
         assert_eq!(f.last_seen, 9);
     }
 
-    fn ip(addr: &str) -> IpAddr {
-        addr.parse().expect("test ip")
+    #[test]
+    fn the_flow_table_is_bounded_and_keeps_the_busy() {
+        let mut s = state(&[]);
+        for i in 0..(MAX_FLOWS + 500) {
+            // A unique conversation each time: ports run out, so the address has to
+            // carry the rest, and the test would silently build a tiny table
+            // otherwise.
+            let a = u16::try_from(1024 + (i % 60_000)).unwrap_or(1024);
+            let octet = u8::try_from(i / 60_000).unwrap_or(1);
+            s.observe(
+                "TCP",
+                ep(&format!("10.0.{octet}.1"), a),
+                ep(&format!("10.0.{octet}.2"), a + 1),
+                10,
+                u64::try_from(i).unwrap_or(0),
+            );
+        }
+        s.trim_flows();
+        assert!(s.flows.len() < MAX_FLOWS + 500, "the table must be trimmed");
+        assert!(
+            s.flows.len() >= MAX_FLOWS / 2,
+            "and must not throw away everything"
+        );
     }
 
-    fn mac6(last: u8) -> [u8; 6] {
-        [0x02, 0x00, 0x00, 0x00, 0x00, last]
-    }
+    //────────────────────────────────── devices
 
     #[test]
     fn a_restart_does_not_re_announce_the_network() {
@@ -1186,21 +635,33 @@ mod tests {
         let path = dir.join("devices.json");
 
         let mut first = state(&["192.168.10.200"]);
-        learn_device(&mut first, mac6(1), ip("192.168.10.50"), 100, 0);
-        learn_device(&mut first, mac6(2), ip("192.168.10.51"), 200, 0);
+        devices::learn_device(&mut first, mac6(1), ip("192.168.10.50"), 100, 1_700_000_000);
+        devices::learn_device(&mut first, mac6(2), ip("192.168.10.51"), 200, 1_700_000_000);
         assert_eq!(first.alerts.len(), 2);
-        save_devices(&path, &first).expect("inventory saved");
+        store::save_devices(&path, &first).expect("inventory saved");
 
         // A fresh process, as after a restart or an upgrade.
         let mut second = state(&["192.168.10.200"]);
-        assert_eq!(load_devices(&path, &mut second), 2);
-        assert!(second.alerts.is_empty(), "a restart must not re-announce known devices");
+        assert_eq!(store::load_devices(&path, &mut second), 2);
+        assert!(
+            second.alerts.is_empty(),
+            "a restart must not re-announce known devices"
+        );
         assert_eq!(second.devices[&mac6(1)].bytes, 100);
-        assert!(!second.devices[&mac6(1)].online, "offline until it speaks again");
+        assert!(
+            !second.devices[&mac6(1)].online,
+            "offline until it speaks again"
+        );
 
-        learn_device(&mut second, mac6(1), ip("192.168.10.50"), 5, 10);
-        assert!(second.devices[&mac6(1)].online, "it comes back on its next frame");
-        assert!(second.alerts.is_empty(), "a known device returning is not news");
+        devices::learn_device(&mut second, mac6(1), ip("192.168.10.50"), 5, 1_700_000_100);
+        assert!(
+            second.devices[&mac6(1)].online,
+            "it comes back on its next frame"
+        );
+        assert!(
+            second.alerts.is_empty(),
+            "a known device returning is not news"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1210,6 +671,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nw-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("devices.json");
+        // The old, version 1 shape: a bare array with plain string addresses.
         std::fs::write(
             &path,
             r#"[{"mac": "not-a-mac", "ips": ["192.168.10.9"]},
@@ -1218,24 +680,112 @@ mod tests {
         )
         .expect("wrote");
         let mut s = state(&["192.168.10.200"]);
-        assert_eq!(load_devices(&path, &mut s), 1, "only the usable row is loaded");
-        assert_eq!(s.devices[&mac6(0x0a)].ips, vec![ip("192.168.10.9")], "bad addresses dropped");
+        assert_eq!(
+            store::load_devices(&path, &mut s),
+            1,
+            "only the usable row is loaded"
+        );
+        assert_eq!(s.devices[&mac6(0x0a)].ips.len(), 1, "bad addresses dropped");
         assert_eq!(s.devices[&mac6(0x0a)].packets, 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
+    fn timestamps_from_the_old_relative_clock_are_not_shown_as_dates_in_1970() {
+        let dir = std::env::temp_dir().join(format!("nw-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("devices.json");
+        std::fs::write(
+            &path,
+            r#"[{"mac": "02:00:00:00:00:0b", "ips": ["192.168.10.9"], "first_seen": 1408, "last_seen": 143210}]"#,
+        )
+        .expect("wrote");
+        let mut s = state(&["192.168.10.200"]);
+        assert_eq!(store::load_devices(&path, &mut s), 1);
+        let d = &s.devices[&mac6(0x0b)];
+        assert_eq!(
+            d.first_seen, 0,
+            "an implausible stamp is dropped, not displayed"
+        );
+        assert_eq!(d.last_seen, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_inventory_survives_a_round_trip_with_names_and_history() {
+        let dir = std::env::temp_dir().join(format!("nw-round-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("devices.json");
+
+        let mut s = state(&["192.168.10.200"]);
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.50"), 100, 1_700_000_000);
+        devices::note_peer(
+            &mut s,
+            ip("192.168.10.50"),
+            ip("93.184.216.34"),
+            500,
+            1_700_000_010,
+        );
+        devices::note_port(&mut s, ip("192.168.10.50"), 443, 500);
+        devices::note_domain(&mut s, ip("192.168.10.50"), "example.com");
+        devices::apply_edit(
+            &mut s,
+            real_mac(1),
+            &devices::Edit {
+                name: Some("Study PC".into()),
+                kind: Some("desktop".into()),
+                trust: Some("trusted".into()),
+                notes: Some("wired".into()),
+                quota_gb: Some("20".into()),
+                notify: Some("quiet".into()),
+            },
+        )
+        .expect("edit applies");
+        store::save_devices(&path, &s).expect("saved");
+
+        let mut loaded = state(&["192.168.10.200"]);
+        assert_eq!(store::load_devices(&path, &mut loaded), 1);
+        let d = &loaded.devices[&real_mac(1)];
+        assert_eq!(d.name.as_deref(), Some("Study PC"));
+        assert_eq!(d.kind, Some(Kind::Desktop));
+        assert_eq!(d.trust, Trust::Trusted);
+        assert_eq!(d.notes, "wired");
+        assert_eq!(d.peers.len(), 1, "the peer history is kept");
+        assert_eq!(d.ports.get(&443), Some(&500));
+        assert_eq!(d.domains.get("example.com"), Some(&1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn only_lan_addresses_can_identify_a_host() {
-        assert!(is_lan_address(&ip("192.168.10.243")), "a real host on this LAN");
-        assert!(is_lan_address(&ip("10.0.0.5")), "10/8 is private");
-        assert!(is_lan_address(&ip("172.16.5.5")), "172.16/12 is private");
-        assert!(is_lan_address(&ip("169.254.1.1")), "link-local");
-        assert!(is_lan_address(&ip("fd00::1")), "IPv6 unique-local");
-        assert!(is_lan_address(&ip("fe80::1")), "IPv6 link-local");
-        assert!(!is_lan_address(&ip("149.154.167.92")), "Telegram is remote");
-        assert!(!is_lan_address(&ip("172.67.219.2")), "Cloudflare: 172.67 is NOT private");
-        assert!(!is_lan_address(&ip("172.217.112.4")), "Google: 172.217 is NOT private");
-        assert!(!is_lan_address(&ip("8.8.8.8")), "a public resolver");
+        assert!(
+            devices::is_lan_address(&ip("192.168.10.243")),
+            "a real host on this LAN"
+        );
+        assert!(devices::is_lan_address(&ip("10.0.0.5")), "10/8 is private");
+        assert!(
+            devices::is_lan_address(&ip("172.16.5.5")),
+            "172.16/12 is private"
+        );
+        assert!(devices::is_lan_address(&ip("169.254.1.1")), "link-local");
+        assert!(devices::is_lan_address(&ip("fd00::1")), "IPv6 unique-local");
+        assert!(devices::is_lan_address(&ip("fe80::1")), "IPv6 link-local");
+        assert!(
+            !devices::is_lan_address(&ip("149.154.167.92")),
+            "Telegram is remote"
+        );
+        assert!(
+            !devices::is_lan_address(&ip("172.67.219.2")),
+            "Cloudflare: 172.67 is NOT private"
+        );
+        assert!(
+            !devices::is_lan_address(&ip("172.217.112.4")),
+            "Google: 172.217 is NOT private"
+        );
+        assert!(
+            !devices::is_lan_address(&ip("8.8.8.8")),
+            "a public resolver"
+        );
     }
 
     #[test]
@@ -1244,26 +794,35 @@ mod tests {
         let router = mac6(7);
         // Traffic to the internet arrives with the router's MAC and a remote
         // address; that pair must be refused in both directions.
-        learn_device(&mut s, router, ip("149.154.167.92"), 10, 0);
-        learn_device(&mut s, router, ip("172.67.219.2"), 10, 0);
-        assert!(s.devices.is_empty(), "the router must not be credited with remote servers");
+        devices::learn_device(&mut s, router, ip("149.154.167.92"), 10, 0);
+        devices::learn_device(&mut s, router, ip("172.67.219.2"), 10, 0);
+        assert!(
+            s.devices.is_empty(),
+            "the router must not be credited with remote servers"
+        );
 
         // The same MAC with a LAN address is the genuine host.
-        learn_device(&mut s, router, ip("192.168.10.1"), 10, 0);
-        assert_eq!(s.devices[&router].ips, vec![ip("192.168.10.1")]);
-        assert_eq!(s.alerts.len(), 1, "and it is announced when it is really identified");
+        devices::learn_device(&mut s, router, ip("192.168.10.1"), 10, 0);
+        assert_eq!(s.devices[&router].ips.len(), 1);
+        assert_eq!(
+            s.alerts.len(),
+            1,
+            "and it is announced when it is really identified"
+        );
     }
 
     #[test]
     fn a_new_device_is_announced_exactly_once() {
         let mut s = state(&["192.168.10.200"]);
         let m = mac6(1);
-        learn_device(&mut s, m, ip("192.168.10.50"), 100, 0);
-        learn_device(&mut s, m, ip("192.168.10.50"), 200, 5);
+        devices::learn_device(&mut s, m, ip("192.168.10.50"), 100, 0);
+        devices::learn_device(&mut s, m, ip("192.168.10.50"), 200, 5);
         assert_eq!(s.devices.len(), 1);
-        let announced: Vec<&Alert> = s.alerts.iter().filter(|a| a.kind == "new_device").collect();
-        assert_eq!(announced.len(), 1, "a second sighting must not re-announce the device");
-        assert_eq!(announced[0].severity, "alert");
+        assert_eq!(
+            alert_kinds(&s, "new_device"),
+            1,
+            "a second sighting must not re-announce"
+        );
         let d = s.devices.get(&m).expect("device recorded");
         assert_eq!((d.packets, d.bytes), (2, 300));
         assert_eq!(d.last_seen, 5);
@@ -1272,50 +831,29 @@ mod tests {
     #[test]
     fn broadcast_and_multicast_macs_are_not_devices() {
         let mut s = state(&["192.168.10.200"]);
-        learn_device(&mut s, [0xff; 6], ip("192.168.10.50"), 10, 0);
-        learn_device(&mut s, [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01], ip("224.0.0.1"), 10, 0);
-        learn_device(&mut s, [0x00; 6], ip("192.168.10.51"), 10, 0);
-        assert!(s.devices.is_empty(), "broadcast, multicast and the null MAC are not hosts");
+        devices::learn_device(&mut s, [0xff; 6], ip("192.168.10.50"), 10, 0);
+        devices::learn_device(
+            &mut s,
+            [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01],
+            ip("224.0.0.1"),
+            10,
+            0,
+        );
+        devices::learn_device(&mut s, [0x00; 6], ip("192.168.10.51"), 10, 0);
+        assert!(
+            s.devices.is_empty(),
+            "broadcast, multicast and the null MAC are not hosts"
+        );
     }
 
     #[test]
     fn our_own_addresses_are_not_reported_as_devices() {
         let mut s = state(&["192.168.10.200"]);
-        learn_device(&mut s, mac6(9), ip("192.168.10.200"), 10, 0);
-        assert!(s.devices.is_empty(), "the monitor is not a device on its own LAN");
-    }
-
-    #[test]
-    fn a_silent_device_is_retired_and_alerted_once() {
-        let mut s = state(&["192.168.10.200"]);
-        let m = mac6(2);
-        learn_device(&mut s, m, ip("192.168.10.60"), 10, 0);
-        sweep_devices(&mut s, DEVICE_IDLE_SECS - 1);
-        assert!(s.devices[&m].online, "inside the window it is still online");
-        sweep_devices(&mut s, DEVICE_IDLE_SECS + 1);
-        assert!(!s.devices[&m].online);
-        assert_eq!(
-            s.alerts.iter().filter(|a| a.kind == "device_offline").count(),
-            1,
-            "retiring a device alerts once"
+        devices::learn_device(&mut s, mac6(9), ip("192.168.10.200"), 10, 0);
+        assert!(
+            s.devices.is_empty(),
+            "the monitor is not a device on its own LAN"
         );
-        sweep_devices(&mut s, DEVICE_IDLE_SECS + 120);
-        assert_eq!(
-            s.alerts.iter().filter(|a| a.kind == "device_offline").count(),
-            1,
-            "and does not keep alerting on every sweep"
-        );
-    }
-
-    #[test]
-    fn a_device_that_returns_is_online_again() {
-        let mut s = state(&["192.168.10.200"]);
-        let m = mac6(3);
-        learn_device(&mut s, m, ip("192.168.10.61"), 10, 0);
-        sweep_devices(&mut s, DEVICE_IDLE_SECS + 1);
-        assert!(!s.devices[&m].online);
-        learn_device(&mut s, m, ip("192.168.10.61"), 10, DEVICE_IDLE_SECS + 10);
-        assert!(s.devices[&m].online, "traffic means it is back");
     }
 
     #[test]
@@ -1323,55 +861,259 @@ mod tests {
         let mut s = state(&["192.168.10.200"]);
         let m = mac6(4);
         for i in 0..40 {
-            learn_device(&mut s, m, ip(&format!("192.168.10.{}", 100 + i)), 10, 0);
+            devices::learn_device(&mut s, m, ip(&format!("192.168.10.{}", 100 + i)), 10, 0);
         }
-        assert_eq!(s.devices[&m].ips.len(), MAX_IPS_PER_DEVICE);
+        assert_eq!(s.devices[&m].ips.len(), state::MAX_IPS_PER_DEVICE);
     }
 
     #[test]
-    fn arguments_are_parsed_or_refused() {
-        let ok = parse_args(&[
-            "--iface".into(),
-            "eth0".into(),
-            "--port".into(),
-            "9000".into(),
-            "--demo".into(),
-        ])
-        .expect("valid arguments")
-        .expect("a config, not early return");
-        assert_eq!(ok.iface.as_deref(), Some("eth0"));
-        assert_eq!(ok.port, Some(9000));
-        assert!(ok.demo);
-        assert!(parse_args(&["--nonsense".into()]).is_err(), "a typo must be an error");
+    fn the_inventory_is_bounded_and_keeps_named_devices() {
+        let mut s = state(&["192.168.10.200"]);
+        // Name one device, then flood the inventory past its ceiling.
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.50"), 10, 1_000);
+        devices::apply_edit(
+            &mut s,
+            real_mac(1),
+            &devices::Edit {
+                name: Some("Keeper".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("named");
+        for i in 0..(state::MAX_DEVICES + 20) {
+            let b = u8::try_from(i % 250).unwrap_or(0);
+            let c = u8::try_from(i / 250).unwrap_or(0);
+            let addr = format!("10.{b}.{c}.7");
+            devices::learn_device(&mut s, [0x02, b, 0x00, c, 0x00, 0x01], ip(&addr), 10, 2_000);
+        }
         assert!(
-            parse_args(&["--help".into()]).expect("help is fine").is_none(),
-            "--help does its work and returns"
+            s.devices.len() <= state::MAX_DEVICES,
+            "the inventory must be bounded"
+        );
+        assert_eq!(
+            s.devices.get(&real_mac(1)).and_then(|d| d.name.as_deref()),
+            Some("Keeper"),
+            "a device the operator named is never evicted"
+        );
+    }
+
+    //────────────────────────────────── alerts and suppression
+
+    #[test]
+    fn a_silent_device_is_retired_and_alerted_once_in_its_window() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(2);
+        let t0 = 1_700_000_000;
+        devices::learn_device(&mut s, m, ip("192.168.10.60"), 10, t0);
+        devices::sweep_devices(&mut s, t0 + state::VISUAL_IDLE_SECS - 1);
+        assert!(s.devices[&m].online, "inside the window it is still online");
+        devices::sweep_devices(&mut s, t0 + state::VISUAL_IDLE_SECS + 1);
+        assert!(
+            !s.devices[&m].online,
+            "the dashboard shows it offline quickly"
+        );
+        assert_eq!(
+            alert_kinds(&s, "device_offline"),
+            0,
+            "but 15 minutes of silence is what alerts"
+        );
+        devices::sweep_devices(&mut s, t0 + state::OFFLINE_ALERT_SECS + 1);
+        assert_eq!(alert_kinds(&s, "device_offline"), 1, "the alert fires once");
+        devices::sweep_devices(&mut s, t0 + state::OFFLINE_ALERT_SECS + 120);
+        assert_eq!(
+            alert_kinds(&s, "device_offline"),
+            1,
+            "and not again on every sweep"
+        );
+    }
+
+    #[test]
+    fn a_flapping_device_cannot_alert_more_than_once_per_re_arm_window() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(3);
+        let mut now = 1_700_000_000;
+        devices::learn_device(&mut s, m, ip("192.168.10.61"), 10, now);
+        // Ten minutes on, twenty minutes off, all day: the pattern that produced
+        // 2,519 alerts on this network before the re-arm window existed.
+        for _ in 0..24 {
+            now += state::OFFLINE_ALERT_SECS + 60;
+            devices::sweep_devices(&mut s, now);
+            devices::learn_device(&mut s, m, ip("192.168.10.61"), 10, now);
+            now += 600;
+            devices::sweep_devices(&mut s, now);
+        }
+        let offline = alert_kinds(&s, "device_offline");
+        assert!(
+            offline <= 2,
+            "a day of flapping must not produce an alert per flap (got {offline})"
+        );
+        assert!(
+            offline >= 1,
+            "but the device really was away, so it is mentioned once"
+        );
+    }
+
+    #[test]
+    fn a_device_that_returns_is_online_again() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(5);
+        devices::learn_device(&mut s, m, ip("192.168.10.62"), 10, 1_000);
+        devices::sweep_devices(&mut s, 1_000 + state::VISUAL_IDLE_SECS + 1);
+        assert!(!s.devices[&m].online);
+        devices::learn_device(&mut s, m, ip("192.168.10.62"), 10, 2_000);
+        assert!(s.devices[&m].online, "traffic means it is back");
+    }
+
+    #[test]
+    fn an_ignored_device_is_never_alerted_about() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = mac6(6);
+        devices::learn_device(&mut s, m, ip("192.168.10.63"), 10, 1_700_000_000);
+        assert_eq!(alert_kinds(&s, "new_device"), 1);
+        devices::apply_edit(
+            &mut s,
+            m,
+            &devices::Edit {
+                trust: Some("ignored".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("ignored");
+        let before = s.alerts.len();
+        devices::sweep_devices(&mut s, 1_700_000_000 + state::OFFLINE_ALERT_SECS + 60);
+        assert_eq!(
+            s.alerts.len(),
+            before,
+            "muting a device silences it completely"
+        );
+    }
+
+    #[test]
+    fn two_devices_on_one_address_are_reported() {
+        let mut s = state(&["192.168.10.200"]);
+        let a = real_mac(1);
+        let b = real_mac(2);
+        devices::learn_device(&mut s, a, ip("192.168.10.70"), 10, 1_700_000_000);
+        devices::learn_device(&mut s, b, ip("192.168.10.70"), 10, 1_700_000_100);
+        assert_eq!(alert_kinds(&s, "mac_conflict"), 2, "both holders are named");
+        let detail = s
+            .alerts
+            .iter()
+            .find(|a| a.kind == "mac_conflict")
+            .map(|a| a.detail.clone())
+            .expect("an alert");
+        assert!(
+            detail.contains("192.168.10.70"),
+            "the address is in the message"
+        );
+    }
+
+    #[test]
+    fn an_address_change_is_reported_only_for_a_known_device() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(3);
+        devices::learn_device(&mut s, m, ip("192.168.10.80"), 10, 1_700_000_000);
+        assert_eq!(
+            alert_kinds(&s, "address_change"),
+            0,
+            "the first address is not a change"
+        );
+        devices::learn_device(&mut s, m, ip("192.168.10.81"), 10, 1_700_000_100);
+        assert_eq!(alert_kinds(&s, "address_change"), 1);
+        devices::learn_device(&mut s, m, ip("192.168.10.81"), 10, 1_700_000_200);
+        assert_eq!(
+            alert_kinds(&s, "address_change"),
+            1,
+            "seeing it again is not a change"
+        );
+    }
+
+    #[test]
+    fn an_unusual_volume_is_compared_against_the_device_itself() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(4);
+        let mut now = 1_700_000_000;
+        devices::learn_device(&mut s, m, ip("192.168.10.90"), 1_000, now);
+        // An hour of ordinary traffic, one sighting per minute.
+        for _ in 0..40 {
+            now += 60;
+            devices::learn_device(&mut s, m, ip("192.168.10.90"), 1_000, now);
+            devices::sweep_devices(&mut s, now);
+        }
+        assert_eq!(
+            alert_kinds(&s, "traffic_spike"),
+            0,
+            "steady traffic is not a spike"
+        );
+        // Then one enormous minute.
+        now += 60;
+        devices::learn_device(&mut s, m, ip("192.168.10.90"), 50_000_000, now);
+        devices::sweep_devices(&mut s, now + 60);
+        assert_eq!(
+            alert_kinds(&s, "traffic_spike"),
+            1,
+            "a surge is mentioned once"
+        );
+        devices::sweep_devices(&mut s, now + 120);
+        assert_eq!(alert_kinds(&s, "traffic_spike"), 1, "and not repeated");
+    }
+
+    #[test]
+    fn alert_memory_is_bounded_and_keeps_the_newest() {
+        let mut s = state(&[]);
+        for i in 0..(alerts::ALERT_MEMORY + 25) {
+            alerts::emit_alert(&mut s, "new_device", "alert", "x", &i.to_string());
+        }
+        assert_eq!(
+            s.alerts.len(),
+            alerts::ALERT_MEMORY,
+            "memory must not grow without limit"
+        );
+        let newest = s.alerts.back().expect("one alert");
+        assert_eq!(
+            newest.detail,
+            (alerts::ALERT_MEMORY + 24).to_string(),
+            "newest survive"
         );
     }
 
     #[test]
     fn alerts_reach_both_memory_and_the_spool() {
-        let path = std::env::temp_dir().join(format!("netwatch-alerts-{}.jsonl", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("netwatch-alerts-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut s = state(&[]);
         s.alert_sink = Some(path.clone());
-        emit_alert(&mut s, "new_device", "alert", "aa:bb:cc:dd:ee:ff", "192.168.10.42 first seen");
+        alerts::emit_alert(
+            &mut s,
+            "new_device",
+            "alert",
+            "aa:bb:cc:dd:ee:ff",
+            "192.168.10.42 first seen",
+        );
         assert_eq!(s.alerts.len(), 1);
-        assert_eq!(s.alerts[0].kind, "new_device");
-        assert_eq!(s.alerts[0].severity, "alert");
         let body = std::fs::read_to_string(&path).expect("spool readable");
-        let v: serde_json::Value = serde_json::from_str(body.lines().next().expect("one line")).expect("valid json");
+        let v: serde_json::Value =
+            serde_json::from_str(body.lines().next().expect("one line")).expect("valid json");
         assert_eq!(v["kind"], "new_device");
-        assert!(v["ts"].as_u64().unwrap_or(0) > 0, "alerts carry a wall-clock timestamp");
+        assert!(
+            v["ts"].as_u64().unwrap_or(0) > 0,
+            "alerts carry a wall-clock timestamp"
+        );
+        assert!(
+            v["why"].as_str().unwrap_or("").len() > 20,
+            "every alert explains itself"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn the_spool_is_append_only_one_line_per_alert() {
-        let path = std::env::temp_dir().join(format!("netwatch-spool-{}.jsonl", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("netwatch-spool-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         for _ in 0..3 {
-            write_test_alert(&path).expect("write");
+            alerts::write_test_alert(&path).expect("write");
         }
         let body = std::fs::read_to_string(&path).expect("spool readable");
         assert_eq!(body.lines().count(), 3);
@@ -1382,13 +1124,1159 @@ mod tests {
     }
 
     #[test]
-    fn alert_memory_is_bounded_and_keeps_the_newest() {
-        let mut s = state(&[]);
-        for i in 0..(ALERT_MEMORY + 25) {
-            emit_alert(&mut s, "new_device", "alert", "x", &i.to_string());
+    fn every_alert_kind_explains_itself() {
+        for kind in [
+            "new_device",
+            "device_offline",
+            "device_back_online",
+            "address_change",
+            "mac_conflict",
+            "new_peer",
+            "traffic_spike",
+            "capture_failed",
+            "test",
+        ] {
+            let why = alerts::explain(kind);
+            assert!(
+                why.len() > 40,
+                "{kind} needs a real explanation, got: {why}"
+            );
+            assert!(!why.contains("No explanation"), "{kind} is not covered");
         }
-        assert_eq!(s.alerts.len(), ALERT_MEMORY, "memory must not grow without limit");
-        let newest = &s.alerts[s.alerts.len() - 1];
-        assert_eq!(newest.detail, (ALERT_MEMORY + 24).to_string(), "newest survive, oldest are dropped");
+    }
+
+    //────────────────────────────────── naming and review
+
+    #[test]
+    fn an_edit_names_a_device_and_takes_it_out_of_the_review_queue() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(5);
+        devices::learn_device(&mut s, m, ip("192.168.10.99"), 10, 1_700_000_000);
+        assert!(
+            s.devices[&m].needs_review(),
+            "a new device starts unreviewed"
+        );
+        devices::apply_edit(
+            &mut s,
+            m,
+            &devices::Edit {
+                name: Some("Front door camera".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("edit");
+        let d = &s.devices[&m];
+        assert_eq!(d.name.as_deref(), Some("Front door camera"));
+        assert_eq!(d.trust, Trust::Known, "naming it is a review");
+        assert!(!d.needs_review());
+        assert!(s.dirty, "an edit must be marked for saving");
+    }
+
+    #[test]
+    fn an_empty_name_clears_it_and_a_rubbish_edit_is_refused() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(6);
+        devices::learn_device(&mut s, m, ip("192.168.10.98"), 10, 1_700_000_000);
+        devices::apply_edit(
+            &mut s,
+            m,
+            &devices::Edit {
+                name: Some("Temp".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("set");
+        devices::apply_edit(
+            &mut s,
+            m,
+            &devices::Edit {
+                name: Some(String::new()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("clear");
+        assert!(
+            s.devices[&m].name.is_none(),
+            "an empty name clears the field"
+        );
+
+        let long = "x".repeat(devices::MAX_NAME_CHARS + 1);
+        assert!(
+            devices::apply_edit(
+                &mut s,
+                m,
+                &devices::Edit {
+                    name: Some(long),
+                    ..devices::Edit::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            devices::apply_edit(
+                &mut s,
+                m,
+                &devices::Edit {
+                    kind: Some("toaster".into()),
+                    ..devices::Edit::default()
+                }
+            )
+            .is_err(),
+            "an unknown kind is refused rather than stored"
+        );
+        assert!(
+            devices::apply_edit(
+                &mut s,
+                m,
+                &devices::Edit {
+                    trust: Some("vibes".into()),
+                    ..devices::Edit::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            devices::apply_edit(
+                &mut s,
+                mac6(200),
+                &devices::Edit {
+                    name: Some("ghost".into()),
+                    ..devices::Edit::default()
+                }
+            )
+            .is_err(),
+            "an unknown device is an error, not a silent no-op"
+        );
+        assert!(
+            devices::apply_edit(
+                &mut s,
+                m,
+                &devices::Edit {
+                    name: Some("bad\u{7}name".into()),
+                    ..devices::Edit::default()
+                }
+            )
+            .is_err(),
+            "control characters are not a name"
+        );
+    }
+
+    #[test]
+    fn the_review_queue_lists_unreviewed_devices_newest_first() {
+        let mut s = state(&["192.168.10.200"]);
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.10"), 10, 1_700_000_000);
+        devices::learn_device(&mut s, real_mac(2), ip("192.168.10.11"), 10, 1_700_000_500);
+        devices::apply_edit(
+            &mut s,
+            real_mac(1),
+            &devices::Edit {
+                name: Some("Named".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("named");
+        let queue = devices::review_queue(&s);
+        assert_eq!(
+            queue,
+            vec![real_mac(2)],
+            "only the unreviewed device is queued"
+        );
+    }
+
+    //────────────────────────────────── identification
+
+    #[test]
+    fn a_randomised_address_has_no_maker_and_is_flagged() {
+        // 0x9a has the locally-administered bit set: a phone's private address.
+        let phone = [0x9a, 0x23, 0x0a, 0x5a, 0x5f, 0xe4];
+        assert!(devices::is_randomized(phone));
+        assert!(
+            oui::vendor_for(phone).is_none(),
+            "a throwaway address has no registered maker"
+        );
+        assert!(
+            !devices::is_randomized([0x04, 0xea, 0x56, 0x00, 0x00, 0x01]),
+            "a burnt-in address is not randomised"
+        );
+    }
+
+    #[test]
+    fn a_real_prefix_resolves_to_its_registered_maker() {
+        // 04:EA:56 is registered to Intel, and is what this network's box reports.
+        assert_eq!(
+            oui::vendor_for([0x04, 0xea, 0x56, 0x11, 0x22, 0x33]),
+            Some("Intel Corporate")
+        );
+        assert!(
+            oui::table_size() > 10_000,
+            "the embedded registry is real, not a stub"
+        );
+    }
+
+    /// A history database in the temporary directory, unique per test so the
+    /// suite can run in parallel without two tests sharing a file.
+    fn temp_history(name: &str) -> history::History {
+        let path =
+            std::env::temp_dir().join(format!("netwatch-test-{name}-{}.db", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        history::History::open(&path, 30).expect("a history database")
+    }
+
+    #[test]
+    fn a_frame_from_a_lan_device_is_credited_to_that_device() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, 1_700_000_000);
+        // A frame the device sent to the internet, exactly as the wire hands it
+        // over: the device is the source, the address is not ours.
+        capture::attribute(
+            &mut s,
+            &capture::PacketFacts {
+                src: ip("192.168.10.50"),
+                dst: ip("8.8.8.8"),
+                sport: 51000,
+                dport: 443,
+                len: 100,
+                now: 1_700_000_001,
+            },
+            &[0u8; 100],
+        );
+        let d = &s.devices[&mac];
+        assert_eq!(d.up_bytes, 100, "the sender is credited with its own bytes");
+        assert_eq!(d.day.up, 100, "and today's counter says the same");
+        assert!(d.ports.contains_key(&443), "the port is remembered");
+        assert!(!d.peers.is_empty(), "the conversation is remembered");
+        // And the answer coming back is credited to the same device, the other way.
+        capture::attribute(
+            &mut s,
+            &capture::PacketFacts {
+                src: ip("8.8.8.8"),
+                dst: ip("192.168.10.50"),
+                sport: 443,
+                dport: 51000,
+                len: 100,
+                now: 1_700_000_002,
+            },
+            &[0u8; 100],
+        );
+        assert_eq!(s.devices[&mac].down_bytes, 100);
+        assert_eq!(s.devices[&mac].day.down, 100);
+        // Our own traffic belongs to nobody: it is this machine.
+        capture::attribute(
+            &mut s,
+            &capture::PacketFacts {
+                src: ip("192.168.10.200"),
+                dst: ip("8.8.8.8"),
+                sport: 40000,
+                dport: 443,
+                len: 100,
+                now: 1_700_000_003,
+            },
+            &[0u8; 100],
+        );
+        assert_eq!(
+            s.devices[&mac].up_bytes, 100,
+            "our own traffic is not a device's"
+        );
+    }
+
+    #[test]
+    fn an_address_points_back_at_its_device() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, 1_700_000_000);
+        assert_eq!(
+            s.device_by_ip(ip("192.168.10.50")),
+            Some(mac),
+            "the index answers for a learned address"
+        );
+        assert_eq!(
+            s.device_by_ip(ip("8.8.8.8")),
+            None,
+            "a stranger has no device"
+        );
+        assert_eq!(
+            s.device_by_ip(ip("192.168.10.200")),
+            None,
+            "our own address belongs to no device"
+        );
+    }
+
+    #[test]
+    fn a_budget_is_parsed_exactly() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, 1_700_000_000);
+        let set = |s: &mut State, value: &str| {
+            devices::apply_edit(
+                s,
+                mac,
+                &devices::Edit {
+                    quota_gb: Some(value.into()),
+                    ..devices::Edit::default()
+                },
+            )
+        };
+        set(&mut s, "5").expect("five gigabytes");
+        assert_eq!(s.devices[&mac].quota_bytes, Some(5 * 1_073_741_824));
+        set(&mut s, "1.5").expect("one and a half");
+        assert_eq!(
+            s.devices[&mac].quota_bytes,
+            Some(1_610_612_736),
+            "1 GiB plus five tenths of a GiB, exactly"
+        );
+        set(&mut s, "0").expect("zero is a valid way to say no budget");
+        assert_eq!(s.devices[&mac].quota_bytes, None, "zero clears the budget");
+        assert!(set(&mut s, "abc").is_err(), "not a number");
+        assert!(
+            set(&mut s, "1.55").is_err(),
+            "one decimal place is the limit"
+        );
+        assert!(set(&mut s, "-5").is_err(), "a negative budget is nonsense");
+    }
+
+    #[test]
+    fn a_budget_alert_fires_once_a_day() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        let now = 1_700_000_000;
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, now);
+        devices::apply_edit(
+            &mut s,
+            mac,
+            &devices::Edit {
+                quota_gb: Some("1".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("a one gigabyte budget");
+        // Over the line, but nothing has been flushed yet.
+        s.devices.get_mut(&mac).expect("the device").day.up = 1_200_000_000;
+        let mut hist = temp_history("budget");
+        let mut tracker = history::Tracker::default();
+        history::flush(&mut s, &mut hist, &mut tracker, now, 30).expect("a flush");
+        let count = |s: &State| {
+            s.alerts
+                .iter()
+                .filter(|a| a.kind == "quota_exceeded")
+                .count()
+        };
+        assert_eq!(count(&s), 1, "the budget is mentioned once");
+        assert!(
+            !s.alerts.back().expect("an alert").muted,
+            "a budget alert is worth sending to the operator"
+        );
+        // Twenty sweeps later, still once: the rule is per day, not per gigabyte.
+        for step in 1..20 {
+            s.devices.get_mut(&mac).expect("the device").day.up += 10_000_000;
+            history::flush(&mut s, &mut hist, &mut tracker, now + step * 30, 30).expect("a flush");
+        }
+        assert_eq!(count(&s), 1, "once a day, not once per gigabyte");
+    }
+
+    #[test]
+    fn a_quiet_device_is_still_recorded_but_not_sent() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        let now = 1_700_000_000;
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, now);
+        devices::apply_edit(
+            &mut s,
+            mac,
+            &devices::Edit {
+                notify: Some("quiet".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("a quiet rule");
+        assert_eq!(s.devices[&mac].notify, devices::Notify::Quiet);
+        // Fifteen minutes of silence: an alert, but only in the record.
+        devices::sweep_devices(&mut s, now + 1_000);
+        let offline = s.alerts.back().expect("an offline alert");
+        assert_eq!(offline.kind, "device_offline", "the alert is still raised");
+        assert!(offline.muted, "quiet means the phone stays quiet");
+        // An alert that needs action is never silenced by a quiet rule.
+        devices::learn_device(&mut s, real_mac(2), ip("192.168.10.50"), 100, now + 100);
+        let conflicts: Vec<&alerts::Alert> = s
+            .alerts
+            .iter()
+            .filter(|a| a.kind == "mac_conflict")
+            .collect();
+        assert_eq!(conflicts.len(), 2, "both holders are named");
+        let quiet_one = conflicts
+            .iter()
+            .find(|a| a.mac.as_deref() == Some(&devices::mac_string(mac)))
+            .expect("the quiet device");
+        assert!(
+            !quiet_one.muted,
+            "a conflict is an alert, and a quiet device still gets to warn about one"
+        );
+    }
+
+    #[test]
+    fn never_means_nothing_leaves_the_box_but_everything_is_kept() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        let now = 1_700_000_000;
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, now);
+        devices::apply_edit(
+            &mut s,
+            mac,
+            &devices::Edit {
+                notify: Some("never".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("a never rule");
+        devices::sweep_devices(&mut s, now + 1_000);
+        let offline = s.alerts.back().expect("an offline alert");
+        assert!(offline.muted, "never means never");
+        // `never` is not `ignored`: the alert is in the record, and the device
+        // still counts as being on the network.
+        assert!(
+            s.alerts.iter().any(|a| a.kind == "device_offline"),
+            "the evidence is still collected"
+        );
+        assert!(s.devices.contains_key(&mac));
+        assert_ne!(s.devices[&mac].trust, devices::Trust::Ignored);
+    }
+
+    #[test]
+    fn online_seconds_accumulate_and_a_new_day_starts_over() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        let day1 = 1_700_000_000;
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, day1);
+        let mut hist = temp_history("uptime");
+        let mut tracker = history::Tracker::default();
+        history::flush(&mut s, &mut hist, &mut tracker, day1, 30).expect("a flush");
+        history::flush(&mut s, &mut hist, &mut tracker, day1 + 60, 60).expect("a flush");
+        assert!(
+            s.devices[&mac].day.online_secs >= 90,
+            "sweeps add up: {}",
+            s.devices[&mac].day.online_secs
+        );
+        let today = history::day_of(day1);
+        let stored = hist
+            .today(&devices::mac_string(mac), today)
+            .expect("a stored day");
+        assert!(stored.online_secs >= 90, "and reach the database");
+        assert!(stored.packets >= 1, "so does traffic");
+        // The next UTC day starts from zero, and yesterday stays put.
+        let tomorrow = day1 + history::DAY_SECS;
+        history::flush(&mut s, &mut hist, &mut tracker, tomorrow, 30).expect("a flush");
+        assert_eq!(s.devices[&mac].day.day, history::day_of(tomorrow));
+        assert!(
+            s.devices[&mac].day.online_secs <= 30,
+            "a new day does not inherit yesterday's seconds"
+        );
+        let yesterday = hist
+            .today(&devices::mac_string(mac), today)
+            .expect("yesterday");
+        assert!(yesterday.online_secs >= 90, "yesterday is still there");
+    }
+
+    #[test]
+    fn history_accumulates_survives_and_prunes() {
+        let mut hist = temp_history("prune");
+        let now = 1_700_000_000;
+        let today = history::day_of(now);
+        let mac = "aa:bb:cc:dd:ee:ff";
+        hist.add_day(
+            mac,
+            today,
+            history::DayRow {
+                up: 10,
+                down: 20,
+                packets: 3,
+                online_secs: 60,
+                sessions: 1,
+            },
+        )
+        .expect("a first write");
+        hist.add_day(
+            mac,
+            today,
+            history::DayRow {
+                up: 5,
+                ..history::DayRow::default()
+            },
+        )
+        .expect("a second write");
+        let rows = hist.device_days(mac, 7, now).expect("a read");
+        assert_eq!(rows.len(), 1, "one row per device per day");
+        assert_eq!(rows[0].up, 15, "the deltas add up");
+        assert_eq!(rows[0].down, 20);
+        let net = hist.network_days(7, now).expect("a read");
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].devices, 1, "one device contributed");
+        assert_eq!(net[0].up + net[0].down, 35);
+        let uptime = hist.uptime(7, now).expect("a read");
+        assert_eq!(uptime.len(), 1);
+        assert_eq!(uptime[0].1, 60, "sixty seconds online");
+        assert_eq!(hist.sessions_recorded(mac), 0, "no sessions written yet");
+        hist.add_session(mac, now - 100, now - 40)
+            .expect("a session");
+        hist.add_session(mac, now - 30, now - 30)
+            .expect("a zero-length session is refused");
+        assert_eq!(hist.sessions_recorded(mac), 1);
+        // An old session, to prove retention reaches sessions as well as days.
+        let old = now - 40 * history::DAY_SECS;
+        hist.add_session(mac, old, old + 60)
+            .expect("an old session");
+        assert_eq!(hist.sessions_recorded(mac), 2);
+        // Retention drops what is older than the window.
+        hist.add_day(
+            mac,
+            today - 40,
+            history::DayRow {
+                up: 1,
+                ..history::DayRow::default()
+            },
+        )
+        .expect("an old day");
+        assert_eq!(hist.device_days(mac, 400, now).expect("a read").len(), 2);
+        let removed = hist.prune(now).expect("a prune");
+        assert_eq!(removed, 2, "the old day and the old session are dropped");
+        assert_eq!(hist.device_days(mac, 400, now).expect("a read").len(), 1);
+    }
+
+    #[test]
+    fn a_session_is_written_when_a_device_goes_quiet_and_when_it_returns() {
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        let t = 1_700_000_000;
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, t);
+        let mut hist = temp_history("session");
+        let mut tracker = history::Tracker::default();
+        let text = devices::mac_string(mac);
+        history::flush(&mut s, &mut hist, &mut tracker, t, 30).expect("a flush");
+        // Silence long enough that the sweep retires it.
+        devices::sweep_devices(&mut s, t + 400);
+        history::flush(&mut s, &mut hist, &mut tracker, t + 400, 30).expect("a flush");
+        assert_eq!(
+            hist.sessions_recorded(&text),
+            1,
+            "going quiet closes a session"
+        );
+        // It comes back: a second session opens, and no third is invented.
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, t + 500);
+        history::flush(&mut s, &mut hist, &mut tracker, t + 500, 30).expect("a flush");
+        history::flush(&mut s, &mut hist, &mut tracker, t + 530, 30).expect("a flush");
+        assert_eq!(
+            hist.sessions_recorded(&text),
+            1,
+            "a flush is not a new session"
+        );
+        devices::sweep_devices(&mut s, t + 1_000);
+        history::flush(&mut s, &mut hist, &mut tracker, t + 1_000, 30).expect("a flush");
+        assert_eq!(
+            hist.sessions_recorded(&text),
+            2,
+            "the second session is closed"
+        );
+    }
+
+    #[test]
+    fn a_day_number_reads_as_a_date_and_a_budget_as_gigabytes() {
+        assert_eq!(
+            api::date_text(history::day_of(1_700_000_000)),
+            "2023-11-14",
+            "unix 1700000000 is 2023-11-14 in UTC"
+        );
+        assert_eq!(api::gb_text(1_073_741_824), "1.0");
+        assert_eq!(api::gb_text(1_181_116_006), "1.1");
+        assert_eq!(api::gb_text(16_106_127_360), "15.0");
+        // A device with no budget has no percentage, rather than a misleading 0%.
+        let mut s = state(&["192.168.10.200"]);
+        let mac = real_mac(1);
+        devices::learn_device(&mut s, mac, ip("192.168.10.50"), 100, 1_700_000_000);
+        let d = s.devices.get_mut(&mac).expect("a device");
+        assert_eq!(api::quota_state(d), "none");
+        assert_eq!(api::quota_pct(d), None);
+        d.quota_bytes = Some(1000);
+        d.day.up = 500;
+        assert_eq!(api::quota_state(d), "under");
+        assert_eq!(api::quota_pct(d), Some(50));
+        d.day.up = 850;
+        assert_eq!(api::quota_state(d), "near");
+        d.day.up = 5000;
+        assert_eq!(api::quota_state(d), "over");
+        assert_eq!(
+            api::quota_pct(d),
+            Some(500),
+            "over 100% is reported honestly"
+        );
+    }
+
+    #[test]
+    fn a_maker_suggests_a_kind_but_never_claims_to_know() {
+        let mut s = state(&["192.168.10.200"]);
+        // 3C:71:BF is Espressif, which is almost always a smart-home chip.
+        devices::learn_device(
+            &mut s,
+            [0x3c, 0x71, 0xbf, 0x00, 0x00, 0x01],
+            ip("192.168.10.30"),
+            10,
+            1_700_000_000,
+        );
+        let d = &s.devices[&[0x3c, 0x71, 0xbf, 0x00, 0x00, 0x01]];
+        assert_eq!(d.kind, None, "nothing is decided without the operator");
+        assert!(
+            d.effective_kind().is_some(),
+            "but a suggestion is available"
+        );
+        assert_eq!(d.effective_kind().map(Kind::as_str), Some("iot"));
+    }
+
+    #[test]
+    fn a_mac_round_trips_and_junk_is_refused() {
+        assert_eq!(
+            devices::parse_mac("04:EA:56:00:00:01"),
+            Some([0x04, 0xea, 0x56, 0x00, 0x00, 0x01])
+        );
+        assert_eq!(
+            devices::parse_mac("04-EA-56-00-00-01"),
+            Some([0x04, 0xea, 0x56, 0x00, 0x00, 0x01])
+        );
+        assert_eq!(
+            devices::mac_string([0x04, 0xea, 0x56, 0x00, 0x00, 0x01]),
+            "04:ea:56:00:00:01"
+        );
+        assert!(devices::parse_mac("not-a-mac").is_none());
+        assert!(
+            devices::parse_mac("1:2:3:4:5:6").is_some(),
+            "single digits are still hex"
+        );
+        assert!(
+            devices::parse_mac("04:ea:56:00:00").is_none(),
+            "five octets is not an address"
+        );
+        assert!(
+            devices::parse_mac("04:ea:56:00:00:zz").is_none(),
+            "zz is not hex"
+        );
+    }
+
+    #[test]
+    fn peers_exclude_things_a_device_cannot_talk_to() {
+        assert!(
+            !devices::is_recordable_peer(&ip("224.0.0.251")),
+            "a multicast group is not a peer"
+        );
+        assert!(
+            !devices::is_recordable_peer(&ip("239.255.255.250")),
+            "SSDP is not a peer"
+        );
+        assert!(
+            !devices::is_recordable_peer(&ip("255.255.255.255")),
+            "broadcast is not a peer"
+        );
+        assert!(
+            !devices::is_recordable_peer(&ip("127.0.0.1")),
+            "loopback is not a peer"
+        );
+        assert!(devices::is_recordable_peer(&ip("1.1.1.1")));
+        assert!(devices::is_recordable_peer(&ip("192.168.10.5")));
+    }
+
+    //────────────────────────────────── names read from the wire
+
+    #[test]
+    fn a_dns_query_name_is_read_and_a_compressed_one_is_refused() {
+        // A minimal query for "example.com".
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(&[7]);
+        query.extend_from_slice(b"example");
+        query.extend_from_slice(&[3]);
+        query.extend_from_slice(b"com");
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let summary = capture::dns_summary(&query).expect("a query parses");
+        assert_eq!(summary.name, "example.com");
+        assert!(summary.is_query);
+
+        // A compression pointer where the name should be: refused, not guessed.
+        let mut pointer = vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        pointer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        assert!(
+            capture::dns_summary(&pointer).is_none(),
+            "a pointer is not followed"
+        );
+
+        assert!(
+            capture::dns_summary(&[0, 1, 2]).is_none(),
+            "a stub is not a DNS message"
+        );
+        assert!(capture::dns_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn a_dns_answer_gives_the_address_behind_a_name() {
+        // Response: question for "a.example", answer A 93.184.216.34.
+        let mut packet = vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0];
+        packet.extend_from_slice(&[1]);
+        packet.extend_from_slice(b"a");
+        packet.extend_from_slice(&[7]);
+        packet.extend_from_slice(b"example");
+        packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+        packet.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
+        packet.extend_from_slice(&[0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+        let summary = capture::dns_summary(&packet).expect("a response parses");
+        assert!(!summary.is_query);
+        assert_eq!(summary.name, "a.example");
+        assert_eq!(summary.answer, Some(ip("93.184.216.34")));
+    }
+
+    #[test]
+    fn an_mdns_name_becomes_a_suggested_name_but_never_an_override() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(7);
+        devices::learn_device(&mut s, m, ip("192.168.10.40"), 10, 1_700_000_000);
+        devices::note_domain(&mut s, ip("192.168.10.40"), "Living-Room-TV.local");
+        assert_eq!(s.devices[&m].auto_name.as_deref(), Some("Living-Room-TV"));
+        devices::apply_edit(
+            &mut s,
+            m,
+            &devices::Edit {
+                name: Some("Big TV".into()),
+                ..devices::Edit::default()
+            },
+        )
+        .expect("named");
+        devices::note_domain(&mut s, ip("192.168.10.40"), "something-else.local");
+        assert_eq!(
+            s.devices[&m].display_name().as_deref(),
+            Some("Big TV"),
+            "the operator outranks the wire"
+        );
+        assert_eq!(
+            s.devices[&m].auto_name.as_deref(),
+            Some("Living-Room-TV"),
+            "and is not overwritten"
+        );
+    }
+
+    #[test]
+    fn a_resolved_name_labels_the_flows_that_use_it() {
+        let mut s = state(&["192.168.10.200"]);
+        devices::note_resolved(&mut s, "cdn.example.com", ip("93.184.216.34"));
+        assert_eq!(s.host_label(ip("93.184.216.34")), "cdn.example.com");
+        assert_eq!(
+            s.host_label(ip("1.2.3.4")),
+            "1.2.3.4",
+            "an unknown address stays an address"
+        );
+    }
+
+    #[test]
+    fn domain_lists_stay_bounded() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(8);
+        devices::learn_device(&mut s, m, ip("192.168.10.41"), 10, 1_700_000_000);
+        for i in 0..(state::MAX_DOMAINS_PER_DEVICE * 3) {
+            devices::note_domain(&mut s, ip("192.168.10.41"), &format!("host{i}.example.com"));
+        }
+        assert_eq!(s.devices[&m].domains.len(), state::MAX_DOMAINS_PER_DEVICE);
+    }
+
+    //────────────────────────────────── history and graphs
+
+    #[test]
+    fn traffic_buckets_fill_gaps_and_stay_bounded() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(9);
+        let base = 1_700_000_000;
+        devices::learn_device(&mut s, m, ip("192.168.10.42"), 500, base);
+        // Silence for a day, then traffic again: the graph must not grow an
+        // unbounded number of empty minutes.
+        devices::learn_device(&mut s, m, ip("192.168.10.42"), 900, base + 86_400);
+        let d = &s.devices[&m];
+        assert!(
+            d.buckets.len() <= state::BUCKETS,
+            "buckets are capped at an hour"
+        );
+        assert!(
+            d.buckets.iter().any(|v| *v >= 900),
+            "the recent traffic is in there"
+        );
+        let spark = d.sparkline(base + 86_400);
+        assert_eq!(spark.len(), state::BUCKETS);
+        assert!(
+            spark.last().copied().unwrap_or(0) >= 900,
+            "the newest minute is last"
+        );
+    }
+
+    #[test]
+    fn series_samples_rates_and_stays_bounded() {
+        let mut s = state(&[]);
+        let mut now = 1_700_000_000;
+        for _ in 0..(state::SERIES_LEN * 2) {
+            now += state::SERIES_STEP_SECS;
+            s.packets += 50;
+            s.bytes += 5_000;
+            let (packets, bytes) = (s.packets, s.bytes);
+            s.series.sample(packets, bytes, now);
+        }
+        assert_eq!(
+            s.series.packets.len(),
+            state::SERIES_LEN,
+            "the graph window is bounded"
+        );
+        assert_eq!(s.series.packets_per_s, 10, "50 packets every 5 seconds");
+        assert_eq!(s.series.bytes_per_s, 1_000);
+    }
+
+    //────────────────────────────────── api and http
+
+    #[test]
+    fn the_summary_carries_the_numbers_and_the_explanations() {
+        let mut s = state(&["192.168.10.200"]);
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.50"), 100, 1_700_000_000);
+        s.observe(
+            "TCP",
+            ep("192.168.10.50", 40000),
+            ep("1.1.1.1", 443),
+            100,
+            1_700_000_000,
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&api::summary_json(&s, 1_700_000_100)).expect("valid json");
+        assert_eq!(json["devices"]["total"], 1);
+        assert_eq!(
+            json["devices"]["review"], 1,
+            "an unreviewed device is in the queue count"
+        );
+        assert_eq!(json["health"]["state"], "ok");
+        assert!(json["health"]["headline"].as_str().unwrap_or("").len() > 5);
+        assert!(json["oui_prefixes"].as_u64().unwrap_or(0) > 10_000);
+    }
+
+    #[test]
+    fn a_capture_failure_is_reported_as_the_worst_state() {
+        let mut s = state(&["192.168.10.200"]);
+        s.packets = 10;
+        s.error = Some("permission denied: CAP_NET_RAW is not held".into());
+        let json: serde_json::Value =
+            serde_json::from_str(&api::summary_json(&s, 1_700_000_100)).expect("valid json");
+        assert_eq!(json["health"]["state"], "bad");
+        assert!(
+            json["health"]["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("CAP_NET_RAW")
+        );
+    }
+
+    #[test]
+    fn the_device_endpoint_answers_with_history_and_hints() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = [0x9a, 0x23, 0x0a, 0x5a, 0x5f, 0xe4];
+        devices::learn_device(&mut s, m, ip("192.168.10.83"), 100, 1_700_000_000);
+        devices::note_peer(
+            &mut s,
+            ip("192.168.10.83"),
+            ip("93.184.216.34"),
+            5_000,
+            1_700_000_010,
+        );
+        let body = api::device_json(&s, "9a:23:0a:5a:5f:e4", 1_700_000_100, None).expect("found");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(json["randomized"], true);
+        assert_eq!(json["kind_source"], "none");
+        assert_eq!(json["peer_list"][0]["ip"], "93.184.216.34");
+        assert!(json["ip_history"][0]["first_seen"].as_u64().unwrap_or(0) > 0);
+        let hints = json["hints"].as_array().expect("hints");
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.as_str().unwrap_or("").contains("randomised"))
+        );
+        assert!(
+            api::device_json(&s, "aa:bb:cc:dd:ee:ff", 0, None).is_none(),
+            "unknown device is a 404"
+        );
+        assert!(
+            api::device_json(&s, "nonsense", 0, None).is_none(),
+            "junk is a 404, not a panic"
+        );
+    }
+
+    #[test]
+    fn the_legacy_stats_endpoint_still_answers() {
+        let mut s = state(&["192.168.10.200"]);
+        s.observe(
+            "TCP",
+            ep("192.168.10.200", 5000),
+            ep("1.1.1.1", 443),
+            10,
+            1_700_000_000,
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&api::stats_json(&s, 1_700_000_100)).expect("valid json");
+        for key in [
+            "alerts",
+            "alert_count",
+            "devices",
+            "device_count",
+            "by_proto",
+            "top_hosts",
+            "top_flows",
+            "uptime_s",
+        ] {
+            assert!(
+                !json[key].is_null(),
+                "the documented key {key} must still be there"
+            );
+        }
+    }
+
+    #[test]
+    fn the_glossary_parses_and_every_entry_can_explain_itself() {
+        let json: serde_json::Value = serde_json::from_str(http::GLOSSARY).expect("valid json");
+        let terms = json.as_array().expect("an array of terms");
+        assert!(
+            terms.len() >= 25,
+            "a glossary this dashboard needs is not three entries"
+        );
+        for term in terms {
+            let name = term["term"].as_str().unwrap_or("");
+            let body = term["body"].as_str().unwrap_or("");
+            assert!(!name.is_empty(), "every entry is named");
+            assert!(body.len() > 40, "{name} needs a real explanation");
+            assert!(
+                term.get("short")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !s.is_empty()),
+                "{name} needs a one-line version for the tooltips"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_is_self_contained() {
+        assert!(http::DASHBOARD.contains("<!doctype html"));
+        assert!(
+            !http::DASHBOARD.contains("http://") && !http::DASHBOARD.contains("https://"),
+            "the page must not reach out to a CDN"
+        );
+        assert!(!http::SCRIPT.contains("http://") && !http::SCRIPT.contains("https://"));
+        assert!(!http::STYLE.contains("http://") && !http::STYLE.contains("https://"));
+        assert!(
+            http::DASHBOARD.contains("glossary"),
+            "the page links to the glossary"
+        );
+        assert!(
+            http::SCRIPT.contains("/api/devices"),
+            "the page reads the device API"
+        );
+        assert!(
+            http::SCRIPT.contains("method"),
+            "the page can write an edit"
+        );
+    }
+
+    #[test]
+    fn queries_are_parsed_and_decoded() {
+        let q = http::Query::parse("/api/flows?limit=25&q=two%20words&proto=TCP");
+        assert_eq!(q.get("limit"), Some("25".into()));
+        assert_eq!(
+            q.get("q"),
+            Some("two words".into()),
+            "percent escapes are decoded"
+        );
+        assert_eq!(q.get("proto"), Some("TCP".into()));
+        assert_eq!(q.get("missing"), None);
+        assert_eq!(q.get_usize("limit"), Some(25));
+        assert_eq!(q.get_usize("q"), None, "a non-number is not a number");
+        assert_eq!(http::Query::parse("/api/devices").get("limit"), None);
+        assert_eq!(http::Query::of(&[("a", "b")]).get("a"), Some("b".into()));
+    }
+
+    #[test]
+    fn csv_output_is_quoted_where_it_has_to_be() {
+        assert_eq!(api::csv_field("plain"), "plain");
+        assert_eq!(api::csv_field("has,comma"), "\"has,comma\"");
+        assert_eq!(api::csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(api::csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn exports_come_back_with_a_filename_and_the_right_type() {
+        let mut s = state(&["192.168.10.200"]);
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.50"), 100, 1_700_000_000);
+        let (ctype, name, body) =
+            api::export(&s, &http::Query::of(&[("what", "devices")]), 1_700_000_100);
+        assert_eq!(ctype, "text/csv; charset=utf-8");
+        assert!(
+            has_extension(&name, "csv"),
+            "the export names its format: {name}"
+        );
+        assert!(body.starts_with("mac,"), "a CSV starts with its header row");
+        assert!(body.contains("04:ea:56:00:00:01"));
+        let (_, json_name, json_body) = api::export(
+            &s,
+            &http::Query::of(&[("what", "devices"), ("format", "json")]),
+            0,
+        );
+        assert!(
+            has_extension(&json_name, "json"),
+            "the export names its format: {json_name}"
+        );
+        serde_json::from_str::<serde_json::Value>(&json_body).expect("valid json export");
+        let (_, alerts_name, _) = api::export(&s, &http::Query::of(&[("what", "alerts")]), 0);
+        assert!(alerts_name.contains("alerts"));
+    }
+
+    #[test]
+    fn alerts_can_be_filtered_by_kind_and_severity() {
+        let mut s = state(&[]);
+        alerts::emit_alert(&mut s, "new_device", "alert", "aa", "one");
+        alerts::emit_alert(&mut s, "device_offline", "notable", "bb", "two");
+        let json: serde_json::Value = serde_json::from_str(&api::alerts_json(
+            &s,
+            &http::Query::of(&[("kind", "device_offline")]),
+        ))
+        .expect("valid json");
+        assert_eq!(json["alerts"].as_array().expect("array").len(), 1);
+        assert_eq!(json["alerts"][0]["kind"], "device_offline");
+        assert_eq!(json["counts"]["alert"], 1);
+        assert_eq!(json["counts"]["notable"], 1);
+        let all: serde_json::Value =
+            serde_json::from_str(&api::alerts_json(&s, &http::Query::of(&[]))).expect("json");
+        assert_eq!(all["alerts"].as_array().expect("array").len(), 2);
+        let kinds = all["kinds"].as_array().expect("kinds");
+        assert!(
+            kinds.len() >= 9,
+            "the dashboard lists every kind with its explanation"
+        );
+    }
+
+    #[test]
+    fn flows_can_be_searched_by_name_service_or_address() {
+        let mut s = state(&["192.168.10.200"]);
+        devices::learn_device(&mut s, real_mac(1), ip("192.168.10.50"), 100, 1_700_000_000);
+        s.observe(
+            "TCP",
+            ep("192.168.10.50", 40000),
+            ep("93.184.216.34", 443),
+            100,
+            1_700_000_000,
+        );
+        devices::note_resolved(&mut s, "cdn.example.com", ip("93.184.216.34"));
+        let hit: serde_json::Value =
+            serde_json::from_str(&api::flows_json(&s, &http::Query::of(&[("q", "example")])))
+                .expect("json");
+        assert_eq!(hit["flows"].as_array().expect("array").len(), 1);
+        assert_eq!(hit["flows"][0]["service"], "https");
+        assert_eq!(hit["flows"][0]["remote"], true);
+        let miss: serde_json::Value = serde_json::from_str(&api::flows_json(
+            &s,
+            &http::Query::of(&[("q", "nothing-here")]),
+        ))
+        .expect("json");
+        assert!(miss["flows"].as_array().expect("array").is_empty());
+        let by_mac = api::flows_json(&s, &http::Query::of(&[("mac", "04:ea:56:00:00:01")]));
+        let by_mac: serde_json::Value = serde_json::from_str(&by_mac).expect("json");
+        assert_eq!(by_mac["flows"].as_array().expect("array").len(), 1);
+    }
+
+    #[test]
+    fn impossible_lengths_and_unknown_ports_do_not_break_anything() {
+        assert!(state::plausible_len(1500));
+        assert!(!state::plausible_len(200_000));
+        assert_eq!(devices::port_label(443), "https");
+        assert_eq!(devices::port_label(5353), "mdns (local discovery)");
+        assert_eq!(
+            devices::port_label(64_999),
+            "",
+            "an unknown port is simply unknown"
+        );
+    }
+
+    #[test]
+    fn humanised_numbers_read_the_way_a_person_writes_them() {
+        assert_eq!(devices::humanise_bytes(999), "999 B");
+        assert_eq!(devices::humanise_bytes(1024), "1.0 KB");
+        assert_eq!(devices::humanise_bytes(1024 * 1024 * 3 / 2), "1.5 MB");
+        assert_eq!(devices::humanise_secs(45), "45s");
+        assert_eq!(devices::humanise_secs(300), "5m 0s");
+        assert_eq!(devices::humanise_secs(3661), "1h 1m");
+        assert_eq!(devices::humanise_secs(90_000), "1d 1h");
+    }
+
+    #[test]
+    fn arguments_are_parsed_or_refused() {
+        let ok = parse_args(&[
+            "--iface".into(),
+            "eth0".into(),
+            "--port".into(),
+            "9000".into(),
+            "--devices".into(),
+            "/tmp/d.json".into(),
+            "--demo".into(),
+        ])
+        .expect("valid arguments")
+        .expect("a config, not early return");
+        assert_eq!(ok.iface.as_deref(), Some("eth0"));
+        assert_eq!(ok.port, Some(9000));
+        assert!(ok.demo);
+        assert!(
+            ok.dns_names,
+            "reading DNS names is on unless it is turned off"
+        );
+        assert!(
+            !parse_args(&["--no-dns-names".into()])
+                .expect("ok")
+                .expect("config")
+                .dns_names
+        );
+        assert!(
+            parse_args(&["--nonsense".into()]).is_err(),
+            "a typo must be an error"
+        );
+        assert!(
+            parse_args(&["--help".into()])
+                .expect("help is fine")
+                .is_none(),
+            "--help returns"
+        );
+        assert!(
+            parse_args(&["--version".into()])
+                .expect("version is fine")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_device_row_carries_what_the_table_shows() {
+        let mut s = state(&["192.168.10.200"]);
+        let m = real_mac(1);
+        devices::learn_device(&mut s, m, ip("192.168.10.50"), 100, 1_700_000_000);
+        let row = api::device_row(&s.devices[&m], &s, 1_700_000_100);
+        for key in [
+            "mac",
+            "display_name",
+            "vendor",
+            "randomized",
+            "trust",
+            "ip",
+            "online",
+            "bytes",
+            "spark",
+            "hints",
+            "kind_source",
+            "trust_note",
+        ] {
+            assert!(
+                !row[key].is_null() || key == "display_name",
+                "{key} must be present in a device row"
+            );
+        }
+        assert_eq!(row["vendor"], "Intel Corporate");
+        assert_eq!(row["randomized"], false);
+        assert_eq!(row["bytes_human"], "100 B");
     }
 }
